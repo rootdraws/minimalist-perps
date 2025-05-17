@@ -1,0 +1,33 @@
+{
+  "name": "minimalist-perps",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "compile": "hardhat compile",
+    "test": "hardhat test",
+    "test:coverage": "hardhat coverage",
+    "deploy:local": "hardhat run scripts/deploy.ts --network localhost",
+    "node": "hardhat node",
+    "clean": "hardhat clean",
+    "lint": "solhint 'contracts/**/*.sol'",
+    "lint:fix": "solhint 'contracts/**/*.sol' --fix"
+  },
+  "keywords": [
+    "defi",
+    "perpetuals",
+    "ethereum",
+    "derivatives"
+  ],
+  "author": "",
+  "license": "ISC",
+  "description": "A minimalist perpetual futures trading protocol",
+  "devDependencies": {
+    "@chainlink/contracts": "^0.6.1",
+    "@nomicfoundation/hardhat-ethers": "^3.0.8",
+    "@nomicfoundation/hardhat-toolbox": "^5.0.0",
+    "@openzeppelin/contracts": "^4.9.3",
+    "@uniswap/v3-periphery": "^1.4.4",
+    "ethers": "^6.14.1",
+    "hardhat": "^2.24.0"
+  }
+}
