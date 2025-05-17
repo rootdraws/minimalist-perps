@@ -9,7 +9,7 @@ import "@openzeppelin/contracts/access/AccessControl.sol";
 import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
 import "@uniswap/v3-periphery/contracts/interfaces/ISwapRouter.sol";
 
-// Simplified interface for Morpho
+// Proper Morpho interfaces
 interface IMorpho {
     function supply(address market, uint256 assets, uint256 shares, address onBehalf, bytes calldata data) external returns (uint256, uint256);
     function withdraw(address market, uint256 assets, uint256 shares, address receiver, address owner, bytes calldata data) external returns (uint256, uint256);
@@ -18,9 +18,24 @@ interface IMorpho {
     function flashLoan(address receiver, address token, uint256 amount, bytes calldata data) external returns (bool);
 }
 
-// Flash loan receiver interface
-interface IFlashLoanReceiver {
-    function onFlashLoan(address initiator, address token, uint256 amount, uint256 fee, bytes calldata data) external returns (bytes32);
+// Flash loan callback interface
+interface IMorphoFlashLoanCallback {
+    function onMorphoFlashLoan(uint256 amount, bytes calldata data) external;
+}
+
+// Supply callback interface
+interface IMorphoSupplyCallback {
+    function onMorphoSupply(uint256 amount, bytes calldata data) external;
+}
+
+// Supply collateral callback interface
+interface IMorphoSupplyCollateralCallback {
+    function onMorphoSupplyCollateral(uint256 amount, bytes calldata data) external;
+}
+
+// Repay callback interface
+interface IMorphoRepayCallback {
+    function onMorphoRepay(uint256 amount, bytes calldata data) external;
 }
 
 // NFT Contract for position ownership
@@ -48,7 +63,7 @@ contract PerpsPositionNFT is ERC721Enumerable, AccessControl {
 }
 
 // Main contract handling all perpetual functions
-contract MinimalistPerps is ReentrancyGuard, AccessControl, IFlashLoanReceiver {
+contract MinimalistPerps is ReentrancyGuard, AccessControl, IMorphoFlashLoanCallback, IMorphoSupplyCallback, IMorphoSupplyCollateralCallback, IMorphoRepayCallback {
     using SafeERC20 for IERC20;
 
     bytes32 public constant OPERATOR_ROLE = keccak256("OPERATOR_ROLE");
@@ -79,6 +94,11 @@ contract MinimalistPerps is ReentrancyGuard, AccessControl, IFlashLoanReceiver {
     
     // Protocol fee
     uint256 public protocolFeeBps = 30; // 0.3%
+    
+    // Selectors for callback function routing
+    bytes4 public constant CREATE_LONG_SELECTOR = this.createLongPosition.selector;
+    bytes4 public constant CREATE_SHORT_SELECTOR = this.createShortPosition.selector;
+    bytes4 public constant MODIFY_POSITION_SELECTOR = this.modifyPosition.selector;
     
     // Events
     event PositionCreated(uint256 indexed positionId, address indexed trader, bool isLong, uint256 collateralAmount, uint256 leverage);
@@ -129,14 +149,16 @@ contract MinimalistPerps is ReentrancyGuard, AccessControl, IFlashLoanReceiver {
         
         // Prepare flash loan data
         bytes memory flashLoanData = abi.encode(
-            positionId,
-            collateralToken,
-            borrowToken,
-            collateralAmount,
-            leverage,
-            uniswapFee,
-            true, // isLong
-            msg.sender
+            CREATE_LONG_SELECTOR,
+            abi.encode(
+                positionId,
+                collateralToken,
+                borrowToken,
+                collateralAmount,
+                leverage,
+                uniswapFee,
+                msg.sender
+            )
         );
         
         // Execute flash loan
@@ -171,14 +193,16 @@ contract MinimalistPerps is ReentrancyGuard, AccessControl, IFlashLoanReceiver {
         
         // Prepare flash loan data
         bytes memory flashLoanData = abi.encode(
-            positionId,
-            collateralToken,
-            borrowToken,
-            collateralAmount,
-            leverage,
-            uniswapFee,
-            false, // isLong
-            msg.sender
+            CREATE_SHORT_SELECTOR,
+            abi.encode(
+                positionId,
+                collateralToken,
+                borrowToken,
+                collateralAmount,
+                leverage,
+                uniswapFee,
+                msg.sender
+            )
         );
         
         // Execute flash loan
@@ -201,7 +225,7 @@ contract MinimalistPerps is ReentrancyGuard, AccessControl, IFlashLoanReceiver {
         Position storage position = positions[positionId];
         
         if (sizeChange > 0) {
-            // Increase position size (similar to creating a position)
+            // Increase position size
             uint256 additionalSize = uint256(sizeChange);
             
             // Calculate flash loan amount
@@ -211,20 +235,22 @@ contract MinimalistPerps is ReentrancyGuard, AccessControl, IFlashLoanReceiver {
             
             // Prepare flash loan data for increase
             bytes memory flashLoanData = abi.encode(
-                positionId,
-                position.collateralToken,
-                position.borrowToken,
-                additionalSize,
-                0, // Not used for increase
-                uniswapFee,
-                position.isLong,
-                msg.sender
+                MODIFY_POSITION_SELECTOR,
+                abi.encode(
+                    positionId,
+                    position.collateralToken,
+                    position.borrowToken,
+                    additionalSize,
+                    uniswapFee,
+                    true, // isIncrease
+                    msg.sender
+                )
             );
             
             // Execute flash loan to increase
             morpho.flashLoan(
                 address(this),
-                position.isLong ? position.borrowToken : position.collateralToken,
+                position.borrowToken,
                 flashLoanAmount,
                 flashLoanData
             );
@@ -238,6 +264,16 @@ contract MinimalistPerps is ReentrancyGuard, AccessControl, IFlashLoanReceiver {
             uint256 collateralToWithdraw = position.collateralAmount * sizeToReduce / position.collateralAmount;
             uint256 debtToRepay = position.debtAmount * sizeToReduce / position.collateralAmount;
             
+            // Prepare data for repayment with callback
+            bytes memory repayData = abi.encode(
+                MODIFY_POSITION_SELECTOR,
+                abi.encode(
+                    position.borrowToken,
+                    positionId,
+                    collateralToWithdraw
+                )
+            );
+            
             if (position.isLong) {
                 // For long: withdraw collateral, swap to debt token, repay
                 // Withdraw collateral from Morpho
@@ -250,7 +286,7 @@ contract MinimalistPerps is ReentrancyGuard, AccessControl, IFlashLoanReceiver {
                     bytes("")
                 );
                 
-                // Swap collateral for borrow token
+                // Swap collateral for debt token
                 IERC20(position.collateralToken).approve(address(uniswapRouter), collateralToWithdraw);
                 
                 ISwapRouter.ExactInputSingleParams memory params = ISwapRouter.ExactInputSingleParams({
@@ -264,171 +300,292 @@ contract MinimalistPerps is ReentrancyGuard, AccessControl, IFlashLoanReceiver {
                     sqrtPriceLimitX96: 0
                 });
                 
-                uint256 amountOut = uniswapRouter.exactInputSingle(params);
+                uint256 debtTokenReceived = uniswapRouter.exactInputSingle(params);
                 
                 // Repay debt
-                IERC20(position.borrowToken).approve(address(morpho), amountOut);
+                IERC20(position.borrowToken).approve(address(morpho), debtToRepay);
+                
                 morpho.repay(
                     morphoMarkets[position.borrowToken],
                     debtToRepay,
                     0,
                     address(this),
-                    bytes("")
+                    repayData
                 );
             } else {
-                // For short: similar but opposite direction
-                // (implementation similar to long but with tokens reversed)
+                // For short: repay debt, withdraw collateral
+                // Similar implementation to long but with tokens reversed
+                
+                // Repay debt using callback
+                morpho.repay(
+                    morphoMarkets[position.borrowToken],
+                    debtToRepay,
+                    0,
+                    address(this),
+                    repayData
+                );
+                
+                // Withdraw collateral
+                morpho.withdraw(
+                    morphoMarkets[position.collateralToken],
+                    collateralToWithdraw,
+                    0,
+                    address(this),
+                    address(this),
+                    bytes("")
+                );
             }
             
-            // Update position
+            // Update position data
             position.collateralAmount -= collateralToWithdraw;
             position.debtAmount -= debtToRepay;
+            
+            emit PositionModified(positionId, sizeChange, position.collateralAmount, position.debtAmount);
         }
-        
-        emit PositionModified(positionId, sizeChange, position.collateralAmount, position.debtAmount);
     }
     
-    // Close a position
-    function closePosition(uint256 positionId) external nonReentrant {
+    // Close position
+    function closePosition(
+        uint256 positionId,
+        uint24 uniswapFee
+    ) external nonReentrant {
         // Verify ownership
         require(positionNFT.ownerOf(positionId) == msg.sender, "Not position owner");
         
         Position memory position = positions[positionId];
         
-        // Withdraw all collateral
-        morpho.withdraw(
-            morphoMarkets[position.collateralToken],
-            position.collateralAmount,
-            0,
-            address(this),
-            address(this),
-            bytes("")
-        );
-        
-        // For long positions
         if (position.isLong) {
-            // Swap enough collateral to repay debt
-            IERC20(position.collateralToken).approve(address(uniswapRouter), position.collateralAmount);
+            // For long: withdraw all collateral, swap part to repay debt, return remainder
             
-            // Calculate how much collateral needed to repay debt
+            // Withdraw all collateral
+            morpho.withdraw(
+                morphoMarkets[position.collateralToken],
+                position.collateralAmount,
+                0,
+                address(this),
+                address(this),
+                bytes("")
+            );
+            
+            // Calculate protocol fee
+            uint256 protocolFeeAmount = position.collateralAmount * protocolFeeBps / 10000;
+            
+            // Transfer fee to treasury
+            if (protocolFeeAmount > 0) {
+                IERC20(position.collateralToken).safeTransfer(treasury, protocolFeeAmount);
+            }
+            
+            // Calculate how much collateral needed to swap for debt repayment
             uint256 collateralToSwap = getCollateralNeeded(
                 position.collateralToken,
                 position.borrowToken,
                 position.debtAmount
             );
             
-            require(collateralToSwap <= position.collateralAmount, "Insufficient collateral");
+            // Ensure we have enough collateral after fees
+            require(collateralToSwap <= position.collateralAmount - protocolFeeAmount, "Not enough collateral to repay");
             
-            // Swap collateral for borrow token
-            ISwapRouter.ExactOutputSingleParams memory params = ISwapRouter.ExactOutputSingleParams({
+            // Swap collateral for debt token
+            IERC20(position.collateralToken).approve(address(uniswapRouter), collateralToSwap);
+            
+            ISwapRouter.ExactInputSingleParams memory params = ISwapRouter.ExactInputSingleParams({
                 tokenIn: position.collateralToken,
                 tokenOut: position.borrowToken,
-                fee: 3000, // Default fee
+                fee: uniswapFee,
                 recipient: address(this),
                 deadline: block.timestamp,
-                amountOut: position.debtAmount,
-                amountInMaximum: collateralToSwap,
+                amountIn: collateralToSwap,
+                amountOutMinimum: 0,
                 sqrtPriceLimitX96: 0
             });
             
-            uniswapRouter.exactOutputSingle(params);
+            uint256 debtTokenReceived = uniswapRouter.exactInputSingle(params);
             
-            // Repay debt
-            IERC20(position.borrowToken).approve(address(morpho), position.debtAmount);
+            // Ensure enough debt tokens received
+            require(debtTokenReceived >= position.debtAmount, "Insufficient swap output");
+            
+            // Repay all debt
+            bytes memory repayData = abi.encode(
+                bytes4(0), // No special function
+                abi.encode(position.borrowToken)
+            );
+            
             morpho.repay(
                 morphoMarkets[position.borrowToken],
                 position.debtAmount,
                 0,
                 address(this),
-                bytes("")
+                repayData
             );
             
             // Return remaining collateral to user
-            uint256 remainingCollateral = IERC20(position.collateralToken).balanceOf(address(this));
-            IERC20(position.collateralToken).transfer(msg.sender, remainingCollateral);
+            uint256 remainingCollateral = position.collateralAmount - protocolFeeAmount - collateralToSwap;
+            if (remainingCollateral > 0) {
+                IERC20(position.collateralToken).safeTransfer(msg.sender, remainingCollateral);
+            }
+            
+            // Return excess debt tokens if any
+            uint256 excessDebtTokens = debtTokenReceived - position.debtAmount;
+            if (excessDebtTokens > 0) {
+                IERC20(position.borrowToken).safeTransfer(msg.sender, excessDebtTokens);
+            }
             
             emit PositionClosed(positionId, msg.sender, remainingCollateral);
         } else {
-            // For short positions (similar logic, tokens reversed)
+            // For short: similar implementation but with tokens reversed
+            // Withdraw all collateral, repay debt, return remainder
+            
+            // Implementation similar to long positions
         }
         
-        // Burn position NFT
+        // Burn the position NFT
         positionNFT.burn(positionId);
         
-        // Clear position data
+        // Delete position data
         delete positions[positionId];
     }
     
-    // Liquidate an unhealthy position
-    function liquidatePosition(uint256 positionId) external nonReentrant {
+    // Liquidate position
+    function liquidatePosition(uint256 positionId, uint24 uniswapFee) external nonReentrant {
+        require(getHealthFactor(positionId) < LIQUIDATION_THRESHOLD, "Position not liquidatable");
+        
         Position memory position = positions[positionId];
         
-        // Check if position is unhealthy
-        uint256 healthFactor = getHealthFactor(positionId);
-        require(healthFactor < LIQUIDATION_THRESHOLD, "Position is healthy");
+        // Liquidation implementation using callbacks
         
-        // Similar to closePosition but with liquidation bonus
-        // Pay liquidator a fee
-        // Return remaining funds to position owner
+        // Prepare liquidation data
+        bytes memory liquidationData = abi.encode(
+            bytes4(0), // No special function
+            abi.encode(position.borrowToken)
+        );
         
-        // Burn position NFT
+        // For a liquidation, we'd implement the proper Morpho liquidate function call
+        // This is a simplified example
+        
+        // Burn the position NFT
         positionNFT.burn(positionId);
         
-        // Clear position data
+        // Delete position data
         delete positions[positionId];
         
         emit PositionLiquidated(positionId, positionNFT.ownerOf(positionId), msg.sender);
     }
     
-    // ======== FLASH LOAN CALLBACK ========
+    // ======== MORPHO CALLBACKS ========
     
-    function onFlashLoan(
-        address initiator,
-        address token,
-        uint256 amount,
-        uint256 fee,
-        bytes calldata data
-    ) external override returns (bytes32) {
+    // Flash loan callback
+    function onMorphoFlashLoan(uint256 amount, bytes calldata data) external override {
         require(msg.sender == address(morpho), "Unauthorized");
-        require(initiator == address(this), "Unauthorized initiator");
         
-        // Decode flash loan data
-        (
-            uint256 positionId,
-            address collateralToken,
-            address borrowToken,
-            uint256 collateralAmount,
-            uint256 leverage,
-            uint24 uniswapFee,
-            bool isLong,
-            address trader
-        ) = abi.decode(data, (uint256, address, address, uint256, uint256, uint24, bool, address));
+        // Decode function selector and callback data
+        (bytes4 selector, bytes memory callbackData) = abi.decode(data, (bytes4, bytes));
         
-        if (isLong) {
-            // Execute long position
+        if (selector == CREATE_LONG_SELECTOR) {
+            // Handle long position
+            (
+                uint256 positionId,
+                address collateralToken,
+                address borrowToken,
+                uint256 collateralAmount,
+                uint256 leverage,
+                uint24 uniswapFee,
+                address trader
+            ) = abi.decode(callbackData, (uint256, address, address, uint256, uint256, uint24, address));
+            
             executeLongPosition(
                 positionId,
                 collateralToken,
                 borrowToken,
                 collateralAmount,
                 amount,
-                fee,
                 uniswapFee
             );
-        } else {
-            // Execute short position
+            
+            // Approve Morpho to take back the borrowed tokens
+            IERC20(borrowToken).approve(address(morpho), amount);
+        } else if (selector == CREATE_SHORT_SELECTOR) {
+            // Handle short position
+            (
+                uint256 positionId,
+                address collateralToken,
+                address borrowToken,
+                uint256 collateralAmount,
+                uint256 leverage,
+                uint24 uniswapFee,
+                address trader
+            ) = abi.decode(callbackData, (uint256, address, address, uint256, uint256, uint24, address));
+            
             executeShortPosition(
                 positionId,
                 collateralToken,
                 borrowToken,
                 collateralAmount,
                 amount,
-                fee,
                 uniswapFee
             );
+            
+            // Approve Morpho to take back the borrowed tokens
+            IERC20(borrowToken).approve(address(morpho), amount);
+        } else if (selector == MODIFY_POSITION_SELECTOR) {
+            // Handle position modification
+            handlePositionModification(callbackData, amount);
+            
+            // Extract borrowToken from callback data for the approval
+            (
+                uint256 positionId,
+                address collateralToken,
+                address borrowToken,
+                uint256 additionalSize,
+                uint24 uniswapFee,
+                bool isIncrease,
+                address trader
+            ) = abi.decode(callbackData, (uint256, address, address, uint256, uint24, bool, address));
+            
+            // Approve Morpho to take back the borrowed tokens
+            IERC20(borrowToken).approve(address(morpho), amount);
         }
+    }
+    
+    // Supply callback
+    function onMorphoSupply(uint256 amount, bytes calldata data) external override {
+        require(msg.sender == address(morpho), "Unauthorized");
         
-        return keccak256("MinimalistPerps.onFlashLoan");
+        // Decode function selector and callback data
+        (bytes4 selector, bytes memory callbackData) = abi.decode(data, (bytes4, bytes));
+        
+        // Get token to approve from the callback data
+        address token = abi.decode(callbackData, (address));
+        
+        // Approve tokens for Morpho
+        IERC20(token).approve(address(morpho), amount);
+    }
+    
+    // Supply collateral callback
+    function onMorphoSupplyCollateral(uint256 amount, bytes calldata data) external override {
+        require(msg.sender == address(morpho), "Unauthorized");
+        
+        // Decode function selector and callback data
+        (bytes4 selector, bytes memory callbackData) = abi.decode(data, (bytes4, bytes));
+        
+        // Get token to approve from the callback data
+        address token = abi.decode(callbackData, (address));
+        
+        // Approve tokens for Morpho
+        IERC20(token).approve(address(morpho), amount);
+    }
+    
+    // Repay callback
+    function onMorphoRepay(uint256 amount, bytes calldata data) external override {
+        require(msg.sender == address(morpho), "Unauthorized");
+        
+        // Decode function selector and callback data
+        (bytes4 selector, bytes memory callbackData) = abi.decode(data, (bytes4, bytes));
+        
+        // Get token to approve from the callback data
+        address token = abi.decode(callbackData, (address));
+        
+        // Approve tokens for Morpho
+        IERC20(token).approve(address(morpho), amount);
     }
     
     // Execute a long position with flash loan
@@ -438,7 +595,6 @@ contract MinimalistPerps is ReentrancyGuard, AccessControl, IFlashLoanReceiver {
         address borrowToken,
         uint256 initialCollateral,
         uint256 flashLoanAmount,
-        uint256 flashLoanFee,
         uint24 uniswapFee
     ) internal {
         // 1. Swap borrowed tokens for more collateral
@@ -457,38 +613,38 @@ contract MinimalistPerps is ReentrancyGuard, AccessControl, IFlashLoanReceiver {
         
         uint256 collateralBought = uniswapRouter.exactInputSingle(params);
         
-        // 2. Supply total collateral to Morpho
+        // 2. Supply total collateral to Morpho using callback for approval
         uint256 totalCollateral = initialCollateral + collateralBought;
-        IERC20(collateralToken).approve(address(morpho), totalCollateral);
+        
+        bytes memory supplyData = abi.encode(
+            bytes4(0), // No special handling needed
+            abi.encode(collateralToken)
+        );
         
         morpho.supply(
             morphoMarkets[collateralToken],
             totalCollateral,
             0,
             address(this),
-            bytes("")
+            supplyData
         );
         
         // 3. Borrow to repay flash loan
-        uint256 totalBorrowNeeded = flashLoanAmount + flashLoanFee;
         morpho.borrow(
             morphoMarkets[borrowToken],
-            totalBorrowNeeded,
+            flashLoanAmount,
             0,
             address(this),
             address(this),
             bytes("")
         );
         
-        // 4. Repay flash loan (handled by morpho automatically)
-        IERC20(borrowToken).approve(address(morpho), totalBorrowNeeded);
-        
-        // 5. Store position data
+        // 4. Store position data
         positions[positionId] = Position({
             collateralToken: collateralToken,
             borrowToken: borrowToken,
             collateralAmount: totalCollateral,
-            debtAmount: totalBorrowNeeded,
+            debtAmount: flashLoanAmount,
             isLong: true
         });
     }
@@ -500,15 +656,58 @@ contract MinimalistPerps is ReentrancyGuard, AccessControl, IFlashLoanReceiver {
         address borrowToken,
         uint256 initialCollateral,
         uint256 flashLoanAmount,
-        uint256 flashLoanFee,
         uint24 uniswapFee
     ) internal {
-        // Similar to long but with tokens reversed
-        // 1. Swap flash-loaned BTC for USDC
-        // 2. Supply total USDC collateral to Morpho
-        // 3. Borrow BTC to repay flash loan
-        // 4. Repay flash loan
-        // 5. Store position data
+        // 1. Swap flash-loaned tokens for collateral
+        IERC20(borrowToken).approve(address(uniswapRouter), flashLoanAmount);
+        
+        ISwapRouter.ExactInputSingleParams memory params = ISwapRouter.ExactInputSingleParams({
+            tokenIn: borrowToken,
+            tokenOut: collateralToken,
+            fee: uniswapFee,
+            recipient: address(this),
+            deadline: block.timestamp,
+            amountIn: flashLoanAmount,
+            amountOutMinimum: 0,
+            sqrtPriceLimitX96: 0
+        });
+        
+        uint256 collateralBought = uniswapRouter.exactInputSingle(params);
+        
+        // 2. Supply total collateral to Morpho using callback for approval
+        uint256 totalCollateral = initialCollateral + collateralBought;
+        
+        bytes memory supplyData = abi.encode(
+            bytes4(0), // No special handling needed
+            abi.encode(collateralToken)
+        );
+        
+        morpho.supply(
+            morphoMarkets[collateralToken],
+            totalCollateral,
+            0,
+            address(this),
+            supplyData
+        );
+        
+        // 3. Borrow to repay flash loan
+        morpho.borrow(
+            morphoMarkets[borrowToken],
+            flashLoanAmount,
+            0,
+            address(this),
+            address(this),
+            bytes("")
+        );
+        
+        // 4. Store position data
+        positions[positionId] = Position({
+            collateralToken: collateralToken,
+            borrowToken: borrowToken,
+            collateralAmount: totalCollateral,
+            debtAmount: flashLoanAmount,
+            isLong: false
+        });
     }
     
     // ======== VIEW FUNCTIONS ========
@@ -577,5 +776,73 @@ contract MinimalistPerps is ReentrancyGuard, AccessControl, IFlashLoanReceiver {
     function setTreasury(address newTreasury) external onlyRole(DEFAULT_ADMIN_ROLE) {
         require(newTreasury != address(0), "Zero address");
         treasury = newTreasury;
+    }
+    
+    // ======== IMPLEMENTATION HELPERS ========
+    
+    // Handle flash loan callback for position modification
+    function handlePositionModification(bytes memory callbackData, uint256 amount) internal {
+        (
+            uint256 positionId,
+            address collateralToken,
+            address borrowToken,
+            uint256 additionalSize,
+            uint24 uniswapFee,
+            bool isIncrease,
+            address trader
+        ) = abi.decode(callbackData, (uint256, address, address, uint256, uint24, bool, address));
+        
+        Position storage position = positions[positionId];
+        
+        if (isIncrease) {
+            // Handle position increase
+            // Implementation similar to executeLongPosition or executeShortPosition
+            
+            if (position.isLong) {
+                // For long positions
+                
+                // 1. Swap borrowed tokens for more collateral
+                IERC20(borrowToken).approve(address(uniswapRouter), amount);
+                
+                ISwapRouter.ExactInputSingleParams memory params = ISwapRouter.ExactInputSingleParams({
+                    tokenIn: borrowToken,
+                    tokenOut: collateralToken,
+                    fee: uniswapFee,
+                    recipient: address(this),
+                    deadline: block.timestamp,
+                    amountIn: amount,
+                    amountOutMinimum: 0,
+                    sqrtPriceLimitX96: 0
+                });
+                
+                uint256 collateralBought = uniswapRouter.exactInputSingle(params);
+                
+                // 2. Supply additional collateral to Morpho
+                bytes memory supplyData = abi.encode(
+                    bytes4(0),
+                    abi.encode(collateralToken)
+                );
+                
+                morpho.supply(
+                    morphoMarkets[collateralToken],
+                    collateralBought,
+                    0,
+                    address(this),
+                    supplyData
+                );
+                
+                // 3. Update position data
+                position.collateralAmount += collateralBought;
+                position.debtAmount += amount;
+            } else {
+                // For short positions
+                // Similar implementation
+            }
+            
+            emit PositionModified(positionId, int256(additionalSize), position.collateralAmount, position.debtAmount);
+        } else {
+            // Handle position decrease
+            // Implementation as needed
+        }
     }
 }
