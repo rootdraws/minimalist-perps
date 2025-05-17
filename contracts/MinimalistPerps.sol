@@ -9,34 +9,9 @@ import "@openzeppelin/contracts/access/AccessControl.sol";
 import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
 import "@uniswap/v3-periphery/contracts/interfaces/ISwapRouter.sol";
 
-// Proper Morpho interfaces
-interface IMorpho {
-    function supply(address market, uint256 assets, uint256 shares, address onBehalf, bytes calldata data) external returns (uint256, uint256);
-    function withdraw(address market, uint256 assets, uint256 shares, address receiver, address owner, bytes calldata data) external returns (uint256, uint256);
-    function borrow(address market, uint256 assets, uint256 shares, address onBehalf, address receiver, bytes calldata data) external returns (uint256, uint256);
-    function repay(address market, uint256 assets, uint256 shares, address onBehalf, bytes calldata data) external returns (uint256, uint256);
-    function flashLoan(address receiver, address token, uint256 amount, bytes calldata data) external returns (bool);
-}
-
-// Flash loan callback interface
-interface IMorphoFlashLoanCallback {
-    function onMorphoFlashLoan(uint256 amount, bytes calldata data) external;
-}
-
-// Supply callback interface
-interface IMorphoSupplyCallback {
-    function onMorphoSupply(uint256 amount, bytes calldata data) external;
-}
-
-// Supply collateral callback interface
-interface IMorphoSupplyCollateralCallback {
-    function onMorphoSupplyCollateral(uint256 amount, bytes calldata data) external;
-}
-
-// Repay callback interface
-interface IMorphoRepayCallback {
-    function onMorphoRepay(uint256 amount, bytes calldata data) external;
-}
+// Import official Morpho interfaces
+import "@morpho-org/morpho-blue/src/interfaces/IMorpho.sol";
+import "@morpho-org/morpho-blue/src/interfaces/IMorphoCallbacks.sol";
 
 // NFT Contract for position ownership
 contract PerpsPositionNFT is ERC721Enumerable, AccessControl {
@@ -63,7 +38,13 @@ contract PerpsPositionNFT is ERC721Enumerable, AccessControl {
 }
 
 // Main contract handling all perpetual functions
-contract MinimalistPerps is ReentrancyGuard, AccessControl, IMorphoFlashLoanCallback, IMorphoSupplyCallback, IMorphoSupplyCollateralCallback, IMorphoRepayCallback {
+contract MinimalistPerps is 
+    ReentrancyGuard, 
+    AccessControl, 
+    IMorphoFlashLoanCallback, 
+    IMorphoSupplyCallback, 
+    IMorphoSupplyCollateralCallback, 
+    IMorphoRepayCallback {
     using SafeERC20 for IERC20;
 
     bytes32 public constant OPERATOR_ROLE = keccak256("OPERATOR_ROLE");

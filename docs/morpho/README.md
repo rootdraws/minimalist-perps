@@ -5,41 +5,46 @@ This documentation provides a comprehensive overview of the Minimalist Perpetual
 ## Table of Contents
 
 ### Core Concepts
-- [Market Creation and Management](./core/markets.md) - Creating and configuring perpetual futures markets
-- [Interest Rate Models](./core/interest.md) - How interest accrual is managed in Morpho
-- [Share Accounting System](./core/shares.md) - How Morpho tracks positions using shares
-- [Position Health Management](./core/health.md) - How position health is evaluated and maintained
+- [Market Creation and Management](./concepts/market-creation.md) - Creating and configuring perpetual futures markets
+- [Interest Rate Models](./concepts/interest.md) - How interest accrual is managed in Morpho
+- [Share Accounting System](./concepts/shares.md) - How Morpho tracks positions using shares
+- [Position Health Management](./concepts/health.md) - How position health is evaluated and maintained
 
-### Functions 
-- [Basic Operations](./functions/basic.md) - Core supply/withdraw operations
-- [Management Functions](./functions/management.md) - Asset management operations
-- [View Functions](./functions/view.md) - Position health monitoring
-- [Admin Controls](./functions/admin.md) - Administrative functions and permissions
-- [Authorization](./functions/authorization.md) - Permission systems with EIP-712 signatures
-- [Utilities](./functions/utilities.md) - Batch operations and optimizations
-- [Flash Loans](./functions/flash.md) - Flash loan implementations for leverage
-- [Callbacks](./functions/callbacks.md) - Callback system for composable operations
-- [Rewards](./functions/rewards.md) - Protocol reward handling
+### API Reference 
+- [Basic Operations](./api/basic.md) - Core supply/withdraw operations
+- [Management Functions](./api/management.md) - Asset management operations
+- [View Functions](./api/view.md) - Position health monitoring
+- [Admin Controls](./api/admin.md) - Administrative functions and permissions
+- [Authorization](./api/authorization.md) - Permission systems with EIP-712 signatures
+- [Utilities](./api/utilities.md) - Batch operations and optimizations
+- [Flash Loans](./api/flash.md) - Flash loan implementations for leverage
+- [Callbacks](./api/callbacks.md) - Callback system for composable operations
+- [Rewards](./api/rewards.md) - Protocol reward handling
 
-### Key Operations
-- [Supply](./operations/supply.md) - Providing liquidity to the lending pool
-- [Supply Collateral](./operations/supplyCollateral.md) - Supplying collateral to back positions
-- [Withdraw](./operations/withdraw.md) - Withdrawing supplied assets
-- [Withdraw Collateral](./operations/withdrawCollateral.md) - Withdrawing collateral from positions
-- [Borrowing](./operations/borrowing.md) - Mechanics for leveraged positions
-- [Repayment](./operations/repay.md) - Repaying borrowed assets
-- [Liquidation](./operations/liquidation.md) - Liquidation process and handling bad debt
+### User Guides
+- [Supply](./guides/supply.md) - Providing liquidity to the lending pool
+- [Supply Collateral](./guides/supplyCollateral.md) - Supplying collateral to back positions
+- [Withdraw](./guides/withdraw.md) - Withdrawing supplied assets
+- [Withdraw Collateral](./guides/withdrawCollateral.md) - Withdrawing collateral from positions
+- [Borrowing](./guides/borrowing.md) - Mechanics for leveraged positions
+- [Repayment](./guides/repay.md) - Repaying borrowed assets
+- [Liquidation](./guides/liquidation.md) - Liquidation process and handling bad debt
+- [Leverage](./guides/leverage.md) - Creating leveraged positions using callbacks
+- [Deleverage](./guides/deleverage.md) - Unwinding leveraged positions
 
 ### Integration
 - [Metrics and Monitoring](./integration/metrics.md) - API integration for funding rates and liquidity monitoring
+
+### SDKs
+- [Introduction to Morpho SDKs](./sdk/intro.md) - Overview of available Morpho SDKs and their uses
 
 ## Getting Started
 
 For new users, we recommend the following reading order:
 
-1. Core Concepts: Markets → Share Accounting → Interest Rate Models → Position Health Management
-2. Key Operations: Supply → Supply Collateral → Borrowing → Repayment → Liquidation → Withdraw → Withdraw Collateral
-3. Functions: Basic Operations → View Functions → Management Functions → Callbacks → Authorization
+1. Core Concepts: Market Creation → Share Accounting → Interest Rate Models → Position Health Management
+2. User Guides: Supply → Supply Collateral → Borrowing → Repayment → Liquidation → Withdraw → Withdraw Collateral
+3. API Reference: Basic Operations → View Functions → Management Functions → Callbacks → Authorization
 4. Advanced Topics: Flash Loans → Admin Controls
 
 ## Implementation Notes
