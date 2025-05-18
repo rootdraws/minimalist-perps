@@ -64,6 +64,13 @@ contract MinimalistPerps is
     event PositionModified(uint256 indexed positionId, int256 sizeChange, uint256 newCollateral, uint256 newDebt);
     event PositionClosed(uint256 indexed positionId, address indexed trader, uint256 returnedAmount);
     event PositionLiquidated(uint256 indexed positionId, address indexed trader, address liquidator);
+    event PositionPartiallyLiquidated(
+        uint256 indexed positionId, 
+        address indexed owner, 
+        address liquidator, 
+        uint256 collateralSeized, 
+        uint256 debtRepaid
+    );
     
     constructor(
         address _morpho,
@@ -301,6 +308,8 @@ contract MinimalistPerps is
             
             emit PositionModified(positionId, sizeChange, position.collateralAmount, position.debtAmount);
         }
+        
+        _checkHealthAfterModification(positionId);
     }
     
     // Close position
@@ -409,25 +418,72 @@ contract MinimalistPerps is
         require(getHealthFactor(positionId) < LIQUIDATION_THRESHOLD, "Position not liquidatable");
         
         Position memory position = positions[positionId];
+        address positionOwner = positionNFT.ownerOf(positionId); // Store owner BEFORE burning
         
-        // Liquidation implementation using callbacks
+        // Transfer repayment tokens from liquidator
+        uint256 repayAmount = position.debtAmount;
+        IERC20(position.borrowToken).safeTransferFrom(msg.sender, address(this), repayAmount);
+        IERC20(position.borrowToken).approve(address(morpho), repayAmount);
         
-        // Prepare liquidation data
-        bytes memory liquidationData = abi.encode(
-            bytes4(0), // No special function
-            abi.encode(position.borrowToken)
-        );
+        // Calculate maximum collateral that can be seized
+        uint256 maxSeizable = position.collateralAmount;
         
-        // For a liquidation, we'd implement the proper Morpho liquidate function call
-        // This is a simplified example
+        // Create a MarketParams struct for the Morpho liquidation call
+        bytes32 marketId = morpho.idFromMarketParams(MarketParams({
+            loanToken: position.borrowToken, 
+            collateralToken: position.collateralToken,
+            oracle: address(priceFeeds[position.collateralToken]),
+            irm: morphoMarkets[position.borrowToken], // Using market address as IRM
+            lltv: LIQUIDATION_THRESHOLD * 1e18 / HEALTH_FACTOR_PRECISION // Convert to WAD format
+        }));
         
-        // Burn the position NFT
-        positionNFT.burn(positionId);
-        
-        // Delete position data
-        delete positions[positionId];
-        
-        emit PositionLiquidated(positionId, positionNFT.ownerOf(positionId), msg.sender);
+        // Execute liquidation through Morpho
+        try morpho.liquidate(
+            MarketParams({
+                loanToken: position.borrowToken, 
+                collateralToken: position.collateralToken,
+                oracle: address(priceFeeds[position.collateralToken]),
+                irm: morphoMarkets[position.borrowToken], // Using market address as IRM
+                lltv: LIQUIDATION_THRESHOLD * 1e18 / HEALTH_FACTOR_PRECISION // Convert to WAD format
+            }),
+            positionOwner,
+            maxSeizable, // Amount of collateral to seize
+            0, // No specific repaid shares
+            "" // No callback data
+        ) returns (uint256 seized, uint256 repaid) {
+            // Transfer seized collateral to liquidator
+            IERC20(position.collateralToken).safeTransfer(msg.sender, seized);
+            
+            // Refund any unused debt tokens
+            uint256 debtRemaining = IERC20(position.borrowToken).balanceOf(address(this));
+            if (debtRemaining > 0) {
+                IERC20(position.borrowToken).safeTransfer(msg.sender, debtRemaining);
+            }
+            
+            // Update position data if not fully liquidated
+            if (position.collateralAmount > seized) {
+                position.collateralAmount -= seized;
+                position.debtAmount -= repaid;
+                positions[positionId] = position;
+                
+                // Check if health is restored
+                uint256 newHealth = getHealthFactor(positionId);
+                if (newHealth >= LIQUIDATION_THRESHOLD) {
+                    emit PositionPartiallyLiquidated(positionId, positionOwner, msg.sender, seized, repaid);
+                    return;
+                }
+            }
+            
+            // If position is fully liquidated or still unhealthy, burn the NFT
+            positionNFT.burn(positionId);
+            delete positions[positionId];
+            
+            emit PositionLiquidated(positionId, positionOwner, msg.sender);
+        } catch {
+            // If Morpho liquidation fails, refund the liquidator
+            IERC20(position.borrowToken).safeTransfer(msg.sender, repayAmount);
+            revert("Morpho liquidation failed");
+        }
     }
     
     // ======== MORPHO CALLBACKS ========
@@ -680,6 +736,8 @@ contract MinimalistPerps is
     function getHealthFactor(uint256 positionId) public view returns (uint256) {
         Position memory position = positions[positionId];
         
+        if (position.debtAmount == 0) return type(uint256).max; // No debt = infinite health
+        
         // Get current value of collateral in USD
         uint256 collateralValueUSD = getTokenValueUSD(
             position.collateralToken,
@@ -691,6 +749,8 @@ contract MinimalistPerps is
             position.borrowToken,
             position.debtAmount
         );
+        
+        if (debtValueUSD == 0) return type(uint256).max; // Prevent division by zero
         
         // Calculate health factor (scaled by HEALTH_FACTOR_PRECISION)
         return (collateralValueUSD * HEALTH_FACTOR_PRECISION) / debtValueUSD;
@@ -802,6 +862,19 @@ contract MinimalistPerps is
         } else {
             // Handle position decrease
             // Implementation as needed
+        }
+        
+        _checkHealthAfterModification(positionId);
+    }
+    
+    // Add health check after position modification
+    function _checkHealthAfterModification(uint256 positionId) internal {
+        uint256 healthFactor = getHealthFactor(positionId);
+        require(healthFactor >= LIQUIDATION_THRESHOLD, "Position would be liquidatable");
+        
+        // Update NFT metadata if we have the proper role
+        if (positionNFT.hasRole(positionNFT.METADATA_ROLE(), address(this))) {
+            // Implementation would update NFT metadata to reflect new health
         }
     }
 }
