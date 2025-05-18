@@ -458,3 +458,294 @@ contract YieldStrategy {
    - Share-to-asset conversions may result in rounding errors
    - Ensure consistent rounding direction for accounting safety
    - Maintain precise tracking of user positions 
+
+## Simplified Implementation from MorphoBlueSnippets
+
+MorphoBlueSnippets provides several simplified withdrawal implementations that handle common use cases for withdrawing assets:
+
+### Continued Asset Withdrawal
+
+```solidity
+/// @notice Handles the withdrawal of a specified amount of assets by the caller from a specific market.
+/// @param marketParams The parameters of the market.
+/// @param amount The amount of assets the user is withdrawing.
+/// @return assetsWithdrawn The actual amount of assets withdrawn.
+/// @return sharesWithdrawn The shares withdrawn in return for the assets.
+function withdrawAmount(MarketParams memory marketParams, uint256 amount)
+    external
+    returns (uint256 assetsWithdrawn, uint256 sharesWithdrawn)
+{
+    uint256 shares;
+    address onBehalf = msg.sender;
+    address receiver = msg.sender;
+
+    (assetsWithdrawn, sharesWithdrawn) = morpho.withdraw(marketParams, amount, shares, onBehalf, receiver);
+}
+```
+
+### Withdraw 50% of Assets
+
+```solidity
+/// @notice Handles the withdrawal of 50% of the assets by the caller from a specific market.
+/// @param marketParams The parameters of the market.
+/// @return assetsWithdrawn The actual amount of assets withdrawn.
+/// @return sharesWithdrawn The shares withdrawn in return for the assets.
+function withdraw50Percent(MarketParams memory marketParams)
+    external
+    returns (uint256 assetsWithdrawn, uint256 sharesWithdrawn)
+{
+    Id marketId = marketParams.id();
+    uint256 supplyShares = morpho.position(marketId, msg.sender).supplyShares;
+    uint256 amount;
+    uint256 shares = supplyShares / 2;
+
+    address onBehalf = msg.sender;
+    address receiver = msg.sender;
+
+    (assetsWithdrawn, sharesWithdrawn) = morpho.withdraw(marketParams, amount, shares, onBehalf, receiver);
+}
+```
+
+### Withdraw All Assets
+
+```solidity
+/// @notice Handles the withdrawal of all the assets by the caller from a specific market.
+/// @param marketParams The parameters of the market.
+/// @return assetsWithdrawn The actual amount of assets withdrawn.
+/// @return sharesWithdrawn The shares withdrawn in return for the assets.
+function withdrawAll(MarketParams memory marketParams)
+    external
+    returns (uint256 assetsWithdrawn, uint256 sharesWithdrawn)
+{
+    Id marketId = marketParams.id();
+    uint256 supplyShares = morpho.position(marketId, msg.sender).supplyShares;
+    uint256 amount;
+
+    address onBehalf = msg.sender;
+    address receiver = msg.sender;
+
+    (assetsWithdrawn, sharesWithdrawn) = morpho.withdraw(marketParams, amount, supplyShares, onBehalf, receiver);
+}
+```
+
+### Withdraw Specified Amount or All
+
+A particularly useful pattern is to withdraw a specific amount if available, or all assets if the requested amount exceeds the user's balance:
+
+```solidity
+/// @notice Handles the withdrawal of a specified amount of assets by the caller from a specific market. If the
+/// amount is greater than the total amount suplied by the user, withdraws all the shares of the user.
+/// @param marketParams The parameters of the market.
+/// @param amount The amount of assets the user is withdrawing.
+/// @return assetsWithdrawn The actual amount of assets withdrawn.
+/// @return sharesWithdrawn The shares withdrawn in return for the assets.
+function withdrawAmountOrAll(MarketParams memory marketParams, uint256 amount)
+    external
+    returns (uint256 assetsWithdrawn, uint256 sharesWithdrawn)
+{
+    Id id = marketParams.id();
+
+    address onBehalf = msg.sender;
+    address receiver = msg.sender;
+
+    morpho.accrueInterest(marketParams);
+    uint256 totalSupplyAssets = morpho.totalSupplyAssets(id);
+    uint256 totalSupplyShares = morpho.totalSupplyShares(id);
+    uint256 shares = morpho.supplyShares(id, msg.sender);
+
+    uint256 assetsMax = shares.toAssetsDown(totalSupplyAssets, totalSupplyShares);
+
+    if (amount >= assetsMax) {
+        (assetsWithdrawn, sharesWithdrawn) = morpho.withdraw(marketParams, 0, shares, onBehalf, receiver);
+    } else {
+        (assetsWithdrawn, sharesWithdrawn) = morpho.withdraw(marketParams, amount, 0, onBehalf, receiver);
+    }
+}
+```
+
+## APY Calculation and Market Analysis
+
+When making withdrawal decisions, it's important to understand the current yield of the market. MorphoBlueSnippets provides methods to calculate APY and analyze market conditions:
+
+### Supply APY Calculation
+
+```solidity
+/// @notice Calculates the supply APY (Annual Percentage Yield) for a given market.
+/// @param marketParams The parameters of the market.
+/// @param market The market for which the supply APY is being calculated.
+/// @return supplyApy The calculated supply APY (scaled by WAD).
+function supplyAPY(MarketParams memory marketParams, Market memory market)
+    public
+    view
+    returns (uint256 supplyApy)
+{
+    (uint256 totalSupplyAssets,, uint256 totalBorrowAssets,) = morpho.expectedMarketBalances(marketParams);
+
+    // Get the borrow rate
+    if (marketParams.irm != address(0)) {
+        uint256 utilization = totalBorrowAssets == 0 ? 0 : totalBorrowAssets.wDivUp(totalSupplyAssets);
+        supplyApy = borrowAPY(marketParams, market).wMulDown(1 ether - market.fee).wMulDown(utilization);
+    }
+}
+```
+
+### Borrow APY Calculation
+
+```solidity
+/// @notice Calculates the borrow APY (Annual Percentage Yield) for a given market.
+/// @param marketParams The parameters of the market.
+/// @param market The state of the market.
+/// @return borrowApy The calculated borrow APY (scaled by WAD).
+function borrowAPY(MarketParams memory marketParams, Market memory market)
+    public
+    view
+    returns (uint256 borrowApy)
+{
+    if (marketParams.irm != address(0)) {
+        borrowApy = IIrm(marketParams.irm).borrowRateView(marketParams, market).wTaylorCompounded(365 days);
+    }
+}
+```
+
+### Market Total Supply and Borrow
+
+```solidity
+/// @notice Calculates the total supply of assets in a specific market.
+/// @param marketParams The parameters of the market.
+/// @return totalSupplyAssets The calculated total supply of assets.
+function marketTotalSupply(MarketParams memory marketParams) public view returns (uint256 totalSupplyAssets) {
+    totalSupplyAssets = morpho.expectedTotalSupplyAssets(marketParams);
+}
+
+/// @notice Calculates the total borrow of assets in a specific market.
+/// @param marketParams The parameters of the market.
+/// @return totalBorrowAssets The calculated total borrow of assets.
+function marketTotalBorrow(MarketParams memory marketParams) public view returns (uint256 totalBorrowAssets) {
+    totalBorrowAssets = morpho.expectedTotalBorrowAssets(marketParams);
+}
+```
+
+### User Supply Balance
+
+```solidity
+/// @notice Calculates the total supply balance of a given user in a specific market.
+/// @param marketParams The parameters of the market.
+/// @param user The address of the user whose supply balance is being calculated.
+/// @return totalSupplyAssets The calculated total supply balance.
+function supplyAssetsUser(MarketParams memory marketParams, address user)
+    public
+    view
+    returns (uint256 totalSupplyAssets)
+{
+    totalSupplyAssets = morpho.expectedSupplyAssets(marketParams, user);
+}
+```
+
+## Optimizing Withdrawal Strategies
+
+When implementing withdrawal strategies, consider these approaches:
+
+### Strategy 1: Yield Comparison Before Withdrawal
+
+```solidity
+function shouldWithdraw(MarketParams memory marketParams, Market memory market) public view returns (bool) {
+    // Get current supply APY
+    uint256 currentApy = supplyAPY(marketParams, market);
+    
+    // Get alternative investment opportunity APY (e.g., from another protocol)
+    uint256 alternativeApy = getAlternativeInvestmentApy();
+    
+    // Consider gas costs in the calculation
+    uint256 estimatedGasCost = 200000; // gas units
+    uint256 gasPrice = tx.gasprice;
+    uint256 gasCostInEth = estimatedGasCost * gasPrice;
+    
+    // Convert gas cost to token terms
+    uint256 gasCostInToken = convertEthToToken(gasCostInEth);
+    
+    // Calculate how much the APY difference needs to be to justify the withdrawal
+    uint256 userSupply = supplyAssetsUser(marketParams, msg.sender);
+    uint256 minApyDifference = (gasCostInToken * WAD) / userSupply;
+    
+    // Only withdraw if the alternative is sufficiently better
+    return alternativeApy > currentApy + minApyDifference;
+}
+```
+
+### Strategy 2: Partial Withdrawal Based on Utilization
+
+```solidity
+function optimizedWithdrawalAmount(MarketParams memory marketParams) public view returns (uint256) {
+    // Get market utilization
+    (uint256 totalSupply,, uint256 totalBorrow,) = morpho.expectedMarketBalances(marketParams);
+    uint256 utilization = totalBorrow.wDivUp(totalSupply);
+    
+    // Get user's total supply
+    uint256 userSupply = supplyAssetsUser(marketParams, msg.sender);
+    
+    // If utilization is high, withdraw less to avoid liquidity issues
+    if (utilization > 0.8 * WAD) { // 80% utilization
+        return userSupply / 4;      // Withdraw only 25%
+    } else if (utilization > 0.5 * WAD) { // 50% utilization
+        return userSupply / 2;      // Withdraw 50%
+    } else {
+        return userSupply;          // Safe to withdraw all
+    }
+}
+```
+
+### Strategy 3: Time-Based Withdrawal to Maximize Interest
+
+```solidity
+mapping(address => uint256) public lastInterestAccrualTime;
+
+function withdrawWithMaximizedInterest(MarketParams memory marketParams) external {
+    // Check if interest has accrued since last withdrawal
+    uint256 lastAccrualTime = lastInterestAccrualTime[msg.sender];
+    
+    // Only withdraw if sufficient interest has accrued (e.g., hourly)
+    if (block.timestamp >= lastAccrualTime + 1 hours) {
+        // Explicitly accrue interest to ensure all earnings are captured
+        morpho.accrueInterest(marketParams);
+        
+        // Withdraw all assets
+        (uint256 withdrawnAssets, ) = withdrawAll(marketParams);
+        
+        // Update last accrual time
+        lastInterestAccrualTime[msg.sender] = block.timestamp;
+        
+        // Use the withdrawn assets...
+    }
+}
+```
+
+## Complete Position Management Workflow
+
+A typical workflow for managing lending positions using MorphoBlueSnippets might look like:
+
+1. **Supply Assets**:
+   ```solidity
+   (uint256 assetsSupplied, uint256 sharesReceived) = snippets.supply(marketParams, supplyAmount);
+   ```
+
+2. **Monitor APY**:
+   ```solidity
+   uint256 currentApy = snippets.supplyAPY(marketParams, market);
+   ```
+
+3. **Check Balance**:
+   ```solidity
+   uint256 balance = snippets.supplyAssetsUser(marketParams, address(this));
+   ```
+
+4. **Partial Withdrawal**:
+   ```solidity
+   (uint256 withdrawnAssets, ) = snippets.withdraw50Percent(marketParams);
+   ```
+
+5. **Full Withdrawal**:
+   ```solidity
+   (uint256 withdrawnAssets, ) = snippets.withdrawAll(marketParams);
+   ```
+
+By combining these functions, users can effectively manage their lending positions while maximizing returns and minimizing risks. 

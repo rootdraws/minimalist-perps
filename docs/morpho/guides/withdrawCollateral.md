@@ -385,4 +385,169 @@ Collateral withdrawal is a key part of comprehensive position management, workin
 6. **Liquidation Prevention**:
    - Prevent withdrawals that would immediately trigger liquidation
    - Implement warnings for withdrawals that bring positions close to liquidation
-   - Provide clear visibility into health factor impact of withdrawals 
+   - Provide clear visibility into health factor impact of withdrawals
+
+## Simplified Implementation from MorphoBlueSnippets
+
+Here's a simplified implementation of `withdrawCollateral` from the MorphoBlueSnippets contract:
+
+```solidity
+/// @notice Handles the withdrawal of collateral by the caller from a specific market of a specific amount.
+/// @param marketParams The parameters of the market.
+/// @param amount The amount of collateral the user is withdrawing.
+function withdrawCollateral(MarketParams memory marketParams, uint256 amount) external {
+    address onBehalf = msg.sender;
+    address receiver = msg.sender;
+
+    morpho.withdrawCollateral(marketParams, amount, onBehalf, receiver);
+}
+```
+
+This simplified version delegates directly to the Morpho protocol's `withdrawCollateral` method. It automatically uses the caller as both the owner (`onBehalf`) and the receiver, making it ideal for common use cases where users are managing their own positions.
+
+## Health Factor Calculation
+
+Understanding the health factor is crucial for safe collateral withdrawals. The MorphoBlueSnippets contract provides a helpful implementation:
+
+```solidity
+/// @notice Calculates the health factor of a user in a specific market.
+/// @param marketParams The parameters of the market.
+/// @param id The identifier of the market.
+/// @param user The address of the user whose health factor is being calculated.
+/// @return healthFactor The calculated health factor.
+function userHealthFactor(MarketParams memory marketParams, Id id, address user)
+    public
+    view
+    returns (uint256 healthFactor)
+{
+    uint256 collateralPrice = IOracle(marketParams.oracle).price();
+    uint256 collateral = morpho.collateral(id, user);
+    uint256 borrowed = morpho.expectedBorrowAssets(marketParams, user);
+
+    uint256 maxBorrow = collateral.mulDivDown(collateralPrice, ORACLE_PRICE_SCALE).wMulDown(marketParams.lltv);
+
+    if (borrowed == 0) return type(uint256).max;
+    healthFactor = maxBorrow.wDivDown(borrowed);
+}
+```
+
+A health factor of 1.0 (represented as WAD or 1e18) means the position is at the liquidation threshold. For safe withdrawals, maintain a health factor above 1.0, with higher values representing safer positions.
+
+## Integration with MorphoBlueSnippets
+
+The MorphoBlueSnippets contract provides a comprehensive set of utility functions that work alongside collateral management. Here are some key complementary functions:
+
+### Supply Collateral
+
+```solidity
+/// @notice Handles the supply of collateral by the caller to a specific market.
+/// @param marketParams The parameters of the market.
+/// @param amount The amount of collateral the user is supplying.
+function supplyCollateral(MarketParams memory marketParams, uint256 amount) external {
+    ERC20(marketParams.collateralToken).forceApprove(address(morpho), type(uint256).max);
+    ERC20(marketParams.collateralToken).safeTransferFrom(msg.sender, address(this), amount);
+
+    address onBehalf = msg.sender;
+
+    morpho.supplyCollateral(marketParams, amount, onBehalf, hex"");
+}
+```
+
+### Collateral Balance Check
+
+```solidity
+/// @notice Calculates the total collateral balance of a given user in a specific market.
+/// @dev It uses extSloads to load only one storage slot of the Position struct and save gas.
+/// @param marketId The identifier of the market.
+/// @param user The address of the user whose collateral balance is being calculated.
+/// @return totalCollateralAssets The calculated total collateral balance.
+function collateralAssetsUser(Id marketId, address user) public view returns (uint256 totalCollateralAssets) {
+    bytes32[] memory slots = new bytes32[](1);
+    slots[0] = MorphoStorageLib.positionBorrowSharesAndCollateralSlot(marketId, user);
+    bytes32[] memory values = morpho.extSloads(slots);
+    totalCollateralAssets = uint256(values[0] >> 128);
+}
+```
+
+### Position Closing Strategies
+
+When closing positions, consider these complementary functions from MorphoBlueSnippets:
+
+#### Repay All Borrowed Assets
+
+```solidity
+/// @notice Handles the repayment of all the borrowed assets by the caller to a specific market.
+/// @param marketParams The parameters of the market.
+/// @return assetsRepaid The actual amount of assets repaid.
+/// @return sharesRepaid The shares repaid in return for the assets.
+function repayAll(MarketParams memory marketParams) external returns (uint256 assetsRepaid, uint256 sharesRepaid) {
+    ERC20(marketParams.loanToken).forceApprove(address(morpho), type(uint256).max);
+
+    Id marketId = marketParams.id();
+
+    (,, uint256 totalBorrowAssets, uint256 totalBorrowShares) = morpho.expectedMarketBalances(marketParams);
+    uint256 borrowShares = morpho.position(marketId, msg.sender).borrowShares;
+
+    uint256 repaidAmount = borrowShares.toAssetsUp(totalBorrowAssets, totalBorrowShares);
+    ERC20(marketParams.loanToken).safeTransferFrom(msg.sender, address(this), repaidAmount);
+
+    uint256 amount;
+    address onBehalf = msg.sender;
+    (assetsRepaid, sharesRepaid) = morpho.repay(marketParams, amount, borrowShares, onBehalf, hex"");
+}
+```
+
+#### Withdraw All Supplied Assets
+
+```solidity
+/// @notice Handles the withdrawal of all the assets by the caller from a specific market.
+/// @param marketParams The parameters of the market.
+/// @return assetsWithdrawn The actual amount of assets withdrawn.
+/// @return sharesWithdrawn The shares withdrawn in return for the assets.
+function withdrawAll(MarketParams memory marketParams)
+    external
+    returns (uint256 assetsWithdrawn, uint256 sharesWithdrawn)
+{
+    Id marketId = marketParams.id();
+    uint256 supplyShares = morpho.position(marketId, msg.sender).supplyShares;
+    uint256 amount;
+
+    address onBehalf = msg.sender;
+    address receiver = msg.sender;
+
+    (assetsWithdrawn, sharesWithdrawn) = morpho.withdraw(marketParams, amount, supplyShares, onBehalf, receiver);
+}
+```
+
+## Complete Position Management Workflow
+
+A typical workflow for position management using MorphoBlueSnippets might look like:
+
+1. **Supply Collateral**:
+   ```solidity
+   snippets.supplyCollateral(marketParams, collateralAmount);
+   ```
+
+2. **Borrow Against Collateral**:
+   ```solidity
+   (uint256 borrowed, ) = snippets.borrow(marketParams, borrowAmount);
+   ```
+
+3. **Check Position Health**:
+   ```solidity
+   uint256 health = snippets.userHealthFactor(marketParams, marketId, user);
+   ```
+
+4. **Withdraw Collateral (if safe)**:
+   ```solidity
+   snippets.withdrawCollateral(marketParams, withdrawAmount);
+   ```
+
+5. **Close Position (when needed)**:
+   ```solidity
+   snippets.repayAll(marketParams);
+   // Now that all debt is repaid, collateral can be safely withdrawn
+   snippets.withdrawCollateral(marketParams, collateralBalance);
+   ```
+
+By combining these functions, users can effectively manage their positions while ensuring they remain safe from liquidation. 

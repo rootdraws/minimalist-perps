@@ -278,4 +278,243 @@ function openLongPosition(
     emit PositionCreated(positionId, msg.sender, collateralToken, collateralToken, leverage);
     return positionId;
 }
-``` 
+```
+
+## Simplified Implementations from MorphoBlueSnippets
+
+MorphoBlueSnippets provides streamlined implementations of borrowing functions and utilities for position monitoring:
+
+### Basic Borrowing Function
+
+```solidity
+/// @notice Handles the borrowing of assets by the caller from a specific market.
+/// @param marketParams The parameters of the market.
+/// @param amount The amount of assets the user is borrowing.
+/// @return assetsBorrowed The actual amount of assets borrowed.
+/// @return sharesBorrowed The shares borrowed in return for the assets.
+function borrow(MarketParams memory marketParams, uint256 amount)
+    external
+    returns (uint256 assetsBorrowed, uint256 sharesBorrowed)
+{
+    uint256 shares;
+    address onBehalf = msg.sender;
+    address receiver = msg.sender;
+
+    (assetsBorrowed, sharesBorrowed) = morpho.borrow(marketParams, amount, shares, onBehalf, receiver);
+}
+```
+
+This simplified implementation:
+- Assumes the borrower is also the receiver of the funds (most common case)
+- Uses exact asset amount rather than shares for more predictable outcomes
+- Doesn't handle token transfers or approvals, focusing only on the core borrowing logic
+
+### Accurate Health Factor Calculation
+
+```solidity
+/// @notice Calculates the health factor of a user in a specific market.
+/// @param marketParams The parameters of the market.
+/// @param id The identifier of the market.
+/// @param user The address of the user whose health factor is being calculated.
+/// @return healthFactor The calculated health factor.
+function userHealthFactor(MarketParams memory marketParams, Id id, address user)
+    public
+    view
+    returns (uint256 healthFactor)
+{
+    uint256 collateralPrice = IOracle(marketParams.oracle).price();
+    uint256 collateral = morpho.collateral(id, user);
+    uint256 borrowed = morpho.expectedBorrowAssets(marketParams, user);
+
+    uint256 maxBorrow = collateral.mulDivDown(collateralPrice, ORACLE_PRICE_SCALE).wMulDown(marketParams.lltv);
+
+    if (borrowed == 0) return type(uint256).max;
+    healthFactor = maxBorrow.wDivDown(borrowed);
+}
+```
+
+The health factor calculation:
+1. Gets the current oracle price for the collateral
+2. Retrieves exact collateral and borrow balances
+3. Calculates the maximum borrow capacity based on the loan-to-value ratio
+4. Returns the ratio of maximum borrow capacity to current borrowed amount
+
+A health factor below 1.0 means the position is eligible for liquidation.
+
+### Efficient Position Monitoring
+
+MorphoBlueSnippets provides gas-optimized functions for monitoring position components:
+
+```solidity
+/// @notice Calculates the total borrow balance of a given user in a specific market.
+/// @param marketParams The parameters of the market.
+/// @param user The address of the user whose borrow balance is being calculated.
+/// @return totalBorrowAssets The calculated total borrow balance.
+function borrowAssetsUser(MarketParams memory marketParams, address user)
+    public
+    view
+    returns (uint256 totalBorrowAssets)
+{
+    totalBorrowAssets = morpho.expectedBorrowAssets(marketParams, user);
+}
+
+/// @notice Calculates the total collateral balance of a given user in a specific market.
+/// @dev It uses extSloads to load only one storage slot of the Position struct and save gas.
+/// @param marketId The identifier of the market.
+/// @param user The address of the user whose collateral balance is being calculated.
+/// @return totalCollateralAssets The calculated total collateral balance.
+function collateralAssetsUser(Id marketId, address user) public view returns (uint256 totalCollateralAssets) {
+    bytes32[] memory slots = new bytes32[](1);
+    slots[0] = MorphoStorageLib.positionBorrowSharesAndCollateralSlot(marketId, user);
+    bytes32[] memory values = morpho.extSloads(slots);
+    totalCollateralAssets = uint256(values[0] >> 128);
+}
+```
+
+The `collateralAssetsUser` function is particularly efficient as it uses `extSloads` to directly access storage slots rather than making more expensive function calls.
+
+### Market Analysis Tools
+
+```solidity
+/// @notice Calculates the total supply of assets in a specific market.
+/// @param marketParams The parameters of the market.
+/// @return totalSupplyAssets The calculated total supply of assets.
+function marketTotalSupply(MarketParams memory marketParams) public view returns (uint256 totalSupplyAssets) {
+    totalSupplyAssets = morpho.expectedTotalSupplyAssets(marketParams);
+}
+
+/// @notice Calculates the total borrow of assets in a specific market.
+/// @param marketParams The parameters of the market.
+/// @return totalBorrowAssets The calculated total borrow of assets.
+function marketTotalBorrow(MarketParams memory marketParams) public view returns (uint256 totalBorrowAssets) {
+    totalBorrowAssets = morpho.expectedTotalBorrowAssets(marketParams);
+}
+
+/// @notice Calculates the borrow APY (Annual Percentage Yield) for a given market.
+/// @param marketParams The parameters of the market.
+/// @param market The state of the market.
+/// @return borrowApy The calculated borrow APY (scaled by WAD).
+function borrowAPY(MarketParams memory marketParams, Market memory market)
+    public
+    view
+    returns (uint256 borrowApy)
+{
+    if (marketParams.irm != address(0)) {
+        borrowApy = IIrm(marketParams.irm).borrowRateView(marketParams, market).wTaylorCompounded(365 days);
+    }
+}
+```
+
+These functions help borrowers assess market conditions and borrowing costs before taking on debt.
+
+## Complete Borrowing Workflow Using MorphoBlueSnippets
+
+Here's a recommended borrowing workflow using MorphoBlueSnippets:
+
+### 1. Pre-Borrowing Analysis
+
+```solidity
+// Check market conditions before borrowing
+function analyzeBorrowingMarket(MarketParams memory marketParams) external view returns (
+    uint256 totalSupply,
+    uint256 totalBorrow,
+    uint256 utilizationRate,
+    uint256 currentAPY
+) {
+    Market memory market = morpho.market(marketParams.id());
+    
+    totalSupply = morphoSnippets.marketTotalSupply(marketParams);
+    totalBorrow = morphoSnippets.marketTotalBorrow(marketParams);
+    
+    if (totalSupply > 0) {
+        utilizationRate = totalBorrow * 1e18 / totalSupply;
+    }
+    
+    currentAPY = morphoSnippets.borrowAPY(marketParams, market);
+    
+    return (totalSupply, totalBorrow, utilizationRate, currentAPY);
+}
+```
+
+### 2. Position Simulation
+
+```solidity
+// Simulate borrowing impact on health factor
+function simulateBorrowImpact(
+    MarketParams memory marketParams,
+    uint256 borrowAmount
+) external view returns (uint256 currentHF, uint256 resultingHF) {
+    Id id = marketParams.id();
+    address user = msg.sender;
+    
+    // Get current health factor
+    currentHF = morphoSnippets.userHealthFactor(marketParams, id, user);
+    
+    // Get current balances
+    uint256 collateral = morphoSnippets.collateralAssetsUser(id, user);
+    uint256 borrowed = morphoSnippets.borrowAssetsUser(marketParams, user);
+    
+    // Calculate new borrowed amount
+    uint256 newBorrowed = borrowed + borrowAmount;
+    
+    // Simulate new health factor
+    uint256 collateralPrice = IOracle(marketParams.oracle).price();
+    uint256 maxBorrow = collateral.mulDivDown(collateralPrice, ORACLE_PRICE_SCALE).wMulDown(marketParams.lltv);
+    
+    if (newBorrowed == 0) {
+        resultingHF = type(uint256).max;
+    } else {
+        resultingHF = maxBorrow.wDivDown(newBorrowed);
+    }
+    
+    return (currentHF, resultingHF);
+}
+```
+
+### 3. Execute Borrowing
+
+```solidity
+// Execute borrowing and verify health
+function executeBorrow(
+    MarketParams memory marketParams,
+    uint256 borrowAmount,
+    uint256 minHealthFactor
+) external returns (uint256 assetsBorrowed, uint256 resultingHF) {
+    Id id = marketParams.id();
+    
+    // Execute borrow
+    (assetsBorrowed, ) = morphoSnippets.borrow(marketParams, borrowAmount);
+    
+    // Verify resulting health factor
+    resultingHF = morphoSnippets.userHealthFactor(marketParams, id, msg.sender);
+    
+    // Ensure health factor remains above minimum
+    require(resultingHF >= minHealthFactor, "Health factor too low after borrow");
+    
+    return (assetsBorrowed, resultingHF);
+}
+```
+
+### 4. Post-Borrowing Monitoring
+
+```solidity
+// Track all borrowed positions
+function monitorPositions(
+    MarketParams[] memory marketParams
+) external view returns (BorrowPosition[] memory positions) {
+    positions = new BorrowPosition[](marketParams.length);
+    
+    for (uint256 i = 0; i < marketParams.length; i++) {
+        Id id = marketParams[i].id();
+        
+        positions[i].collateral = morphoSnippets.collateralAssetsUser(id, msg.sender);
+        positions[i].borrowed = morphoSnippets.borrowAssetsUser(marketParams[i], msg.sender);
+        positions[i].healthFactor = morphoSnippets.userHealthFactor(marketParams[i], id, msg.sender);
+        positions[i].marketId = id;
+    }
+    
+    return positions;
+}
+```
+
+This workflow demonstrates how to use MorphoBlueSnippets functions together to create a comprehensive borrowing management system that includes market analysis, position simulation, execution with safety checks, and monitoring. 

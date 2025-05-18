@@ -162,4 +162,156 @@ event LltvEnabled(uint256 lltv);
 event MarketCreated(bytes32 indexed marketId, address loanToken, address collateralToken);
 event MarketSetupComplete(address loanToken, address collateralToken, bytes32 marketId);
 event MarketSetupFailed(address loanToken, address collateralToken, string reason);
+```
+
+## Post-Market Creation Monitoring
+
+After a market is created, it's essential to monitor its performance and health. MorphoBlueSnippets provides several utility functions for market analysis:
+
+### Market APY and Utilization Tracking
+
+```solidity
+/// @notice Calculates the supply APY (Annual Percentage Yield) for a given market.
+function supplyAPY(MarketParams memory marketParams, Market memory market) public view returns (uint256 supplyApy) {
+    (uint256 totalSupplyAssets,, uint256 totalBorrowAssets,) = morpho.expectedMarketBalances(marketParams);
+
+    // Get the borrow rate
+    if (marketParams.irm != address(0)) {
+        uint256 utilization = totalBorrowAssets == 0 ? 0 : totalBorrowAssets.wDivUp(totalSupplyAssets);
+        supplyApy = borrowAPY(marketParams, market).wMulDown(1 ether - market.fee).wMulDown(utilization);
+    }
+}
+
+/// @notice Calculates the borrow APY (Annual Percentage Yield) for a given market.
+function borrowAPY(MarketParams memory marketParams, Market memory market) public view returns (uint256 borrowApy) {
+    if (marketParams.irm != address(0)) {
+        borrowApy = IIrm(marketParams.irm).borrowRateView(marketParams, market).wTaylorCompounded(365 days);
+    }
+}
+```
+
+These functions enable tracking of key performance metrics:
+1. **Supply APY**: The annual yield suppliers can expect to earn
+2. **Borrow APY**: The annual cost borrowers pay for loans
+3. **Utilization Rate**: The ratio of borrowed assets to supplied assets, a key driver of interest rates
+
+### Market Liquidity Analysis
+
+```solidity
+/// @notice Calculates the total supply of assets in a specific market.
+function marketTotalSupply(MarketParams memory marketParams) public view returns (uint256 totalSupplyAssets) {
+    totalSupplyAssets = morpho.expectedTotalSupplyAssets(marketParams);
+}
+
+/// @notice Calculates the total borrow of assets in a specific market.
+function marketTotalBorrow(MarketParams memory marketParams) public view returns (uint256 totalBorrowAssets) {
+    totalBorrowAssets = morpho.expectedTotalBorrowAssets(marketParams);
+}
+```
+
+These functions help monitor the market's liquidity and growth:
+1. Track total assets supplied to the market
+2. Monitor overall borrow demand
+3. Identify supply/demand imbalances that might require intervention
+
+### Risk Assessment with Health Factor Calculation
+
+```solidity
+/// @notice Calculates the health factor of a user in a specific market.
+function userHealthFactor(MarketParams memory marketParams, Id id, address user)
+    public
+    view
+    returns (uint256 healthFactor)
+{
+    uint256 collateralPrice = IOracle(marketParams.oracle).price();
+    uint256 collateral = morpho.collateral(id, user);
+    uint256 borrowed = morpho.expectedBorrowAssets(marketParams, user);
+
+    uint256 maxBorrow = collateral.mulDivDown(collateralPrice, ORACLE_PRICE_SCALE).wMulDown(marketParams.lltv);
+
+    if (borrowed == 0) return type(uint256).max;
+    healthFactor = maxBorrow.wDivDown(borrowed);
+}
+```
+
+The health factor calculation is essential for:
+1. Monitoring the risk level of loans in the market
+2. Identifying positions nearing liquidation thresholds
+3. Evaluating the overall health of the market based on average health factors
+
+### Market Monitoring Dashboard Example
+
+Here's a recommended approach for a comprehensive market monitoring dashboard:
+
+```solidity
+function getMarketStats(MarketParams memory marketParams) external view returns (
+    uint256 supplyRate,
+    uint256 borrowRate,
+    uint256 totalSupply,
+    uint256 totalBorrow,
+    uint256 utilization,
+    uint256 avgHealthFactor
+) {
+    Id id = marketParams.id();
+    Market memory market = morpho.market(id);
+    
+    // Calculate rates
+    supplyRate = supplyAPY(marketParams, market);
+    borrowRate = borrowAPY(marketParams, market);
+    
+    // Calculate supply/borrow
+    totalSupply = marketTotalSupply(marketParams);
+    totalBorrow = marketTotalBorrow(marketParams);
+    
+    // Calculate utilization
+    utilization = totalBorrow == 0 ? 0 : totalBorrow.wDivDown(totalSupply);
+    
+    // Average health factor calculation would require off-chain aggregation
+    // or an on-chain mapping of all positions
+    
+    return (supplyRate, borrowRate, totalSupply, totalBorrow, utilization, avgHealthFactor);
+}
+```
+
+## Market Health Management Best Practices
+
+For newly created markets, follow these best practices:
+
+1. **Initial Seeding**: Consider seeding new markets with some base liquidity to establish stable initial share pricing.
+
+2. **Utilization Rate Monitoring**: Monitor utilization rates closely, as extremely high rates can lead to liquidity crunches.
+
+3. **Oracle Health**: Regularly check oracle price feed reliability, as oracle failures can put the market at risk.
+
+4. **Parameter Adjustments**: Be prepared to adjust interest rate model parameters based on market performance.
+
+5. **Event Monitoring**: Set up alerts for key events such as large withdrawals, borrows, or health factor decreases.
+
+6. **Regular Health Checks**: Implement periodic health checks to ensure market parameters remain appropriate as market conditions evolve:
+
+```solidity
+function performMarketHealthCheck(MarketParams memory marketParams) external view returns (bool healthy, string memory recommendation) {
+    Id id = marketParams.id();
+    Market memory market = morpho.market(id);
+    
+    uint256 utilization = getUtilizationRate(marketParams);
+    uint256 borrowRate = borrowAPY(marketParams, market);
+    
+    // Check for high utilization
+    if (utilization > 0.95e18) {
+        return (false, "Utilization too high; consider adjusting IRM parameters");
+    }
+    
+    // Check for extremely low utilization
+    if (utilization < 0.05e18 && marketTotalSupply(marketParams) > 1000e18) {
+        return (false, "Utilization too low; consider adjusting IRM parameters");
+    }
+    
+    // Check for extremely high borrow rates
+    if (borrowRate > 50e16) { // 50%
+        return (false, "Borrow rate too high; consider adjusting IRM parameters");
+    }
+    
+    return (true, "Market parameters appear optimal");
+}
 ``` 

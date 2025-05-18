@@ -38,6 +38,14 @@ This documentation provides a comprehensive overview of the Minimalist Perpetual
 ### SDKs
 - [Introduction to Morpho SDKs](./sdk/intro.md) - Overview of available Morpho SDKs and their uses
 
+### Oracles
+- [Oracle Overview](./oracles/Oracle.md) - Introduction to oracles in the Morpho ecosystem
+
+### Bundlers
+- [Bundler References](./bundlers/bundler-ref.md) - Links to bundler resources and repositories
+- [Bundler2](./bundlers/bundler2.md) - Simple multi-tool bundler implementation
+- [Bundler3](./bundlers/bundler3.md) - Advanced bundler with enhanced features and SDK integration
+
 ## Getting Started
 
 For new users, we recommend the following reading order:

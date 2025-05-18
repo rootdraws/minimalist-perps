@@ -159,6 +159,109 @@ function calculateTradingFee(address user, uint256 amount) public view returns (
 }
 ```
 
+## Integration with MorphoBlueSnippets
+
+To effectively integrate reward mechanisms with MorphoBlueSnippets functionality, use the following patterns:
+
+### Reward Calculation Based on User Balances
+
+```solidity
+/// @notice Calculate rewards based on user's supply and borrow activity
+/// @param marketParams Array of markets to check for user activity
+/// @param user The user address
+/// @return rewards The calculated rewards amount
+function calculateUserRewards(MarketParams[] memory marketParams, address user) public view returns (uint256 rewards) {
+    uint256 totalActivity = 0;
+    
+    for (uint256 i = 0; i < marketParams.length; i++) {
+        Id id = marketParams[i].id();
+        
+        // Get user balances using MorphoBlueSnippets methods
+        uint256 supplied = morphoSnippets.supplyAssetsUser(marketParams[i], user);
+        uint256 borrowed = morphoSnippets.borrowAssetsUser(marketParams[i], user);
+        uint256 collateral = morphoSnippets.collateralAssetsUser(id, user);
+        
+        // Weight different activities (example weights)
+        uint256 activityValue = 
+            (supplied * supplyWeight) + 
+            (borrowed * borrowWeight) + 
+            (collateral * collateralWeight);
+            
+        totalActivity += activityValue;
+    }
+    
+    // Calculate time-based component
+    uint256 lastAction = userLastAction[user];
+    uint256 timeFactor = block.timestamp - lastAction;
+    
+    // Calculate final reward
+    rewards = (totalActivity * timeFactor * baseRewardRate) / PRECISION;
+    
+    // Apply caps
+    return Math.min(rewards, maxRewardPerPeriod);
+}
+```
+
+### Reward Distribution on Morpho Actions
+
+```solidity
+/// @notice Wrapper around MorphoBlueSnippets functions that also updates rewards
+/// @param marketParams The market parameters
+/// @param amount The amount to supply
+function supplyWithRewards(MarketParams memory marketParams, uint256 amount) external {
+    // Call the underlying function
+    (uint256 assetsSupplied, ) = morphoSnippets.supply(marketParams, amount);
+    
+    // Update reward tracking
+    _updateUserActivity(msg.sender);
+    
+    // Add extra rewards for supply actions
+    userRewardPoints[msg.sender] += (assetsSupplied * supplyRewardPoints) / PRECISION;
+    
+    emit ActivityRewardAdded(msg.sender, "supply", assetsSupplied);
+}
+
+/// @notice Track user activity for reward calculation
+function _updateUserActivity(address user) internal {
+    userLastAction[user] = block.timestamp;
+    userActionCount[user]++;
+}
+```
+
+### Efficient Integration with MorphoBlueSnippets Storage Access
+
+```solidity
+/// @notice Calculate rewards based on user's position health factor
+/// @param marketParams The market parameters
+/// @param id The market ID
+/// @param user The user address
+function calculateHealthBasedRewards(MarketParams memory marketParams, Id id, address user) public view returns (uint256) {
+    // Use MorphoBlueSnippets to get health factor
+    uint256 health = morphoSnippets.userHealthFactor(marketParams, id, user);
+    
+    // Higher rewards for maintaining healthy positions
+    uint256 basePoints = 100;
+    
+    // If health factor is excellent (>2.0), provide bonus rewards
+    if (health > 2e18) {
+        return basePoints * healthBonusMultiplier;
+    }
+    
+    // If health factor is good (1.5-2.0), provide standard rewards
+    if (health > 1.5e18) {
+        return basePoints;
+    }
+    
+    // If health factor is low (1.1-1.5), provide reduced rewards
+    if (health > 1.1e18) {
+        return basePoints / 2;
+    }
+    
+    // Very low health factor gets minimal rewards
+    return basePoints / 10;
+}
+```
+
 ## Backend Requirements
 
 1. **Reward Monitoring**

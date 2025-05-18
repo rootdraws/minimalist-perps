@@ -347,3 +347,186 @@ When integrating with Morpho's share system:
 - **ZeroShares**: Attempted operation with zero shares
 - **ZeroTotalShares**: Market has no shares yet (division by zero)
 - **SharesOverflow**: Share calculation exceeds uint128 limits 
+
+## Practical Share Operations from MorphoBlueSnippets
+
+The MorphoBlueSnippets contract provides efficient implementations that demonstrate how shares are used in practice:
+
+### Real-time Share-to-Asset Conversions
+
+```solidity
+// From withdrawAmountOrAll function - converting shares to assets
+function withdrawAmountOrAll(MarketParams memory marketParams, uint256 amount) external returns (uint256, uint256) {
+    // ...
+    morpho.accrueInterest(marketParams);
+    uint256 totalSupplyAssets = morpho.totalSupplyAssets(id);
+    uint256 totalSupplyShares = morpho.totalSupplyShares(id);
+    uint256 shares = morpho.supplyShares(id, msg.sender);
+
+    // Convert user's shares to assets using the current exchange rate
+    uint256 assetsMax = shares.toAssetsDown(totalSupplyAssets, totalSupplyShares);
+    
+    // If requested amount exceeds available assets, withdraw all shares
+    if (amount >= assetsMax) {
+        return morpho.withdraw(marketParams, 0, shares, onBehalf, receiver);
+    } else {
+        return morpho.withdraw(marketParams, amount, 0, onBehalf, receiver);
+    }
+}
+```
+
+This implementation shows:
+1. Always accrue interest first to ensure accurate exchange rates
+2. Get the current state of total assets/shares from the market
+3. Convert shares to assets using the current market state
+4. Make decisions based on the asset value of shares
+
+### Partial Share-Based Operations
+
+```solidity
+// From repay50Percent function - repaying half of borrow shares
+function repay50Percent(MarketParams memory marketParams) external returns (uint256, uint256) {
+    // ...
+    (,, uint256 totalBorrowAssets, uint256 totalBorrowShares) = morpho.expectedMarketBalances(marketParams);
+    uint256 borrowShares = morpho.position(marketId, msg.sender).borrowShares;
+
+    // Convert half of borrow shares to assets
+    uint256 repaidAmount = (borrowShares / 2).toAssetsUp(totalBorrowAssets, totalBorrowShares);
+    
+    // Transfer exact asset amount needed to repay half of shares
+    ERC20(marketParams.loanToken).safeTransferFrom(msg.sender, address(this), repaidAmount);
+
+    // Repay using shares directly
+    return morpho.repay(marketParams, 0, borrowShares / 2, onBehalf, hex"");
+}
+```
+
+This implementation demonstrates:
+1. Working with fractional share amounts
+2. Pre-calculating the asset equivalent of shares for transfers
+3. Preference for share-based operations when exact share values are known
+
+### Optimized Share Balance Retrieval
+
+```solidity
+/// @notice Calculates the total collateral balance of a given user in a specific market.
+/// @dev It uses extSloads to load only one storage slot of the Position struct and save gas.
+/// @param marketId The identifier of the market.
+/// @param user The address of the user whose collateral balance is being calculated.
+/// @return totalCollateralAssets The calculated total collateral balance.
+function collateralAssetsUser(Id marketId, address user) public view returns (uint256 totalCollateralAssets) {
+    bytes32[] memory slots = new bytes32[](1);
+    slots[0] = MorphoStorageLib.positionBorrowSharesAndCollateralSlot(marketId, user);
+    bytes32[] memory values = morpho.extSloads(slots);
+    totalCollateralAssets = uint256(values[0] >> 128);
+}
+```
+
+This highly optimized function:
+1. Uses low-level storage access for gas efficiency
+2. Targets the specific storage slot where share data is stored
+3. Extracts the data directly from storage without intermediate function calls
+
+### Share Calculation Scenarios
+
+Here are examples of common share calculation scenarios from MorphoBlueSnippets:
+
+#### Supply
+
+```solidity
+// Calculate supply APY based on market share pricing
+function supplyAPY(MarketParams memory marketParams, Market memory market) public view returns (uint256 supplyApy) {
+    (uint256 totalSupplyAssets,, uint256 totalBorrowAssets,) = morpho.expectedMarketBalances(marketParams);
+
+    // Get the borrow rate
+    if (marketParams.irm != address(0)) {
+        uint256 utilization = totalBorrowAssets == 0 ? 0 : totalBorrowAssets.wDivUp(totalSupplyAssets);
+        supplyApy = borrowAPY(marketParams, market).wMulDown(1 ether - market.fee).wMulDown(utilization);
+    }
+}
+```
+
+#### Withdraw
+
+```solidity
+// Withdraw all shares
+function withdrawAll(MarketParams memory marketParams) external returns (uint256 assetsWithdrawn, uint256 sharesWithdrawn) {
+    Id marketId = marketParams.id();
+    uint256 supplyShares = morpho.position(marketId, msg.sender).supplyShares;
+    uint256 amount;
+
+    // Specify shares directly, not assets (amount = 0)
+    (assetsWithdrawn, sharesWithdrawn) = morpho.withdraw(marketParams, amount, supplyShares, onBehalf, receiver);
+}
+```
+
+#### Borrow/Repay
+
+```solidity
+// Repay all based on share calculation
+function repayAll(MarketParams memory marketParams) external returns (uint256 assetsRepaid, uint256 sharesRepaid) {
+    // ...
+    (,, uint256 totalBorrowAssets, uint256 totalBorrowShares) = morpho.expectedMarketBalances(marketParams);
+    uint256 borrowShares = morpho.position(marketId, msg.sender).borrowShares;
+
+    // Calculate exact repayment amount from shares
+    uint256 repaidAmount = borrowShares.toAssetsUp(totalBorrowAssets, totalBorrowShares);
+    
+    // Transfer precise amount needed
+    ERC20(marketParams.loanToken).safeTransferFrom(msg.sender, address(this), repaidAmount);
+
+    // Repay using shares
+    (assetsRepaid, sharesRepaid) = morpho.repay(marketParams, 0, borrowShares, onBehalf, hex"");
+}
+```
+
+### Health Factor Using Share Values
+
+```solidity
+/// @notice Calculates the health factor of a user in a specific market.
+/// @param marketParams The parameters of the market.
+/// @param id The identifier of the market.
+/// @param user The address of the user whose health factor is being calculated.
+/// @return healthFactor The calculated health factor.
+function userHealthFactor(MarketParams memory marketParams, Id id, address user)
+    public
+    view
+    returns (uint256 healthFactor)
+{
+    uint256 collateralPrice = IOracle(marketParams.oracle).price();
+    uint256 collateral = morpho.collateral(id, user);
+    uint256 borrowed = morpho.expectedBorrowAssets(marketParams, user);
+
+    uint256 maxBorrow = collateral.mulDivDown(collateralPrice, ORACLE_PRICE_SCALE).wMulDown(marketParams.lltv);
+
+    if (borrowed == 0) return type(uint256).max;
+    healthFactor = maxBorrow.wDivDown(borrowed);
+}
+```
+
+This function demonstrates how share-based calculations relate to risk assessment:
+1. Collateral is stored directly as assets, not shares
+2. Borrowed assets are calculated from shares via `expectedBorrowAssets`
+3. Health factor uses the final asset values for risk calculation
+
+## Best Practices for Working with Shares
+
+Based on MorphoBlueSnippets implementations, here are additional best practices:
+
+1. **For exact share operations:**
+   - When withdrawing/repaying an exact percentage, use share calculations directly
+   - Specify shares, not assets in Morpho function calls (e.g., `amount = 0, shares = desiredShares`)
+
+2. **For exact asset operations:**
+   - When depositing/borrowing/withdrawing exact asset amounts, use asset parameters
+   - Specify assets, not shares in Morpho function calls (e.g., `amount = desiredAmount, shares = 0`)
+
+3. **For maximum efficiency:**
+   - Use the `accrueInterest` function before share calculations for accuracy
+   - Pre-calculate asset amounts from shares for external token transfers
+   - Consider using direct storage access via `extSloads` for frequent balance checks
+   
+4. **For user experience:**
+   - Always show users asset values, not share values
+   - Calculate and display APY/share growth using the provided utility functions
+   - Implement safety checks to prevent excessive slippage in share-asset conversions 

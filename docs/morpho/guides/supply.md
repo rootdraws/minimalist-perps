@@ -400,3 +400,210 @@ contract YieldOptimizer {
    - Share-based accounting can lead to rounding errors
    - Use consistent rounding directions (always round down for supply shares)
    - Test with extreme values and edge cases 
+
+## Simplified Implementation from MorphoBlueSnippets
+
+The MorphoBlueSnippets contract provides a streamlined implementation of the supply function that handles common use cases:
+
+```solidity
+/// @notice Handles the supply of assets by the caller to a specific market.
+/// @param marketParams The parameters of the market.
+/// @param amount The amount of assets the user is supplying.
+/// @return assetsSupplied The actual amount of assets supplied.
+/// @return sharesSupplied The shares supplied in return for the assets.
+function supply(MarketParams memory marketParams, uint256 amount)
+    external
+    returns (uint256 assetsSupplied, uint256 sharesSupplied)
+{
+    ERC20(marketParams.loanToken).forceApprove(address(morpho), type(uint256).max);
+    ERC20(marketParams.loanToken).safeTransferFrom(msg.sender, address(this), amount);
+
+    uint256 shares;
+    address onBehalf = msg.sender;
+
+    (assetsSupplied, sharesSupplied) = morpho.supply(marketParams, amount, shares, onBehalf, hex"");
+}
+```
+
+This implementation:
+1. Uses `forceApprove` to approve the Morpho contract to spend the loan token (solves common approval issues)
+2. Transfers the loan token from the user to the contract
+3. Supplies the assets to Morpho on behalf of the caller 
+4. Returns both the supplied assets and the corresponding shares
+
+## Enhanced Market Analysis and APY Calculation
+
+MorphoBlueSnippets offers precise APY calculation functions that use the actual market state:
+
+```solidity
+/// @notice Calculates the supply APY (Annual Percentage Yield) for a given market.
+/// @param marketParams The parameters of the market.
+/// @param market The market for which the supply APY is being calculated.
+/// @return supplyApy The calculated supply APY (scaled by WAD).
+function supplyAPY(MarketParams memory marketParams, Market memory market)
+    public
+    view
+    returns (uint256 supplyApy)
+{
+    (uint256 totalSupplyAssets,, uint256 totalBorrowAssets,) = morpho.expectedMarketBalances(marketParams);
+
+    // Get the borrow rate
+    if (marketParams.irm != address(0)) {
+        uint256 utilization = totalBorrowAssets == 0 ? 0 : totalBorrowAssets.wDivUp(totalSupplyAssets);
+        supplyApy = borrowAPY(marketParams, market).wMulDown(1 ether - market.fee).wMulDown(utilization);
+    }
+}
+
+/// @notice Calculates the borrow APY (Annual Percentage Yield) for a given market.
+/// @param marketParams The parameters of the market.
+/// @param market The state of the market.
+/// @return borrowApy The calculated borrow APY (scaled by WAD).
+function borrowAPY(MarketParams memory marketParams, Market memory market)
+    public
+    view
+    returns (uint256 borrowApy)
+{
+    if (marketParams.irm != address(0)) {
+        borrowApy = IIrm(marketParams.irm).borrowRateView(marketParams, market).wTaylorCompounded(365 days);
+    }
+}
+```
+
+Key improvements over the previous implementation:
+1. Uses `expectedMarketBalances` to include pending interest accruals
+2. Utilizes the Taylor series approximation for compounding via `wTaylorCompounded`
+3. Properly handles the fee calculation
+4. More accurately represents the relationship between supply and borrow rates
+
+## Efficient Balance Checking
+
+```solidity
+/// @notice Calculates the total supply balance of a given user in a specific market.
+/// @param marketParams The parameters of the market.
+/// @param user The address of the user whose supply balance is being calculated.
+/// @return totalSupplyAssets The calculated total supply balance.
+function supplyAssetsUser(MarketParams memory marketParams, address user)
+    public
+    view
+    returns (uint256 totalSupplyAssets)
+{
+    totalSupplyAssets = morpho.expectedSupplyAssets(marketParams, user);
+}
+```
+
+This function uses `expectedSupplyAssets` to include accrued interest, providing a more accurate real-time balance than simply converting shares to assets based on current totals.
+
+## Withdrawal Strategies
+
+MorphoBlueSnippets implements several efficient withdrawal strategies to complement supply operations:
+
+### Partial Withdrawal (50%)
+
+```solidity
+/// @notice Handles the withdrawal of 50% of the assets by the caller from a specific market.
+/// @param marketParams The parameters of the market.
+/// @return assetsWithdrawn The actual amount of assets withdrawn.
+/// @return sharesWithdrawn The shares withdrawn in return for the assets.
+function withdraw50Percent(MarketParams memory marketParams)
+    external
+    returns (uint256 assetsWithdrawn, uint256 sharesWithdrawn)
+{
+    Id marketId = marketParams.id();
+    uint256 supplyShares = morpho.position(marketId, msg.sender).supplyShares;
+    uint256 amount;
+    uint256 shares = supplyShares / 2;
+
+    address onBehalf = msg.sender;
+    address receiver = msg.sender;
+
+    (assetsWithdrawn, sharesWithdrawn) = morpho.withdraw(marketParams, amount, shares, onBehalf, receiver);
+}
+```
+
+### Complete Withdrawal
+
+```solidity
+/// @notice Handles the withdrawal of all the assets by the caller from a specific market.
+/// @param marketParams The parameters of the market.
+/// @return assetsWithdrawn The actual amount of assets withdrawn.
+/// @return sharesWithdrawn The shares withdrawn in return for the assets.
+function withdrawAll(MarketParams memory marketParams)
+    external
+    returns (uint256 assetsWithdrawn, uint256 sharesWithdrawn)
+{
+    Id marketId = marketParams.id();
+    uint256 supplyShares = morpho.position(marketId, msg.sender).supplyShares;
+    uint256 amount;
+
+    address onBehalf = msg.sender;
+    address receiver = msg.sender;
+
+    (assetsWithdrawn, sharesWithdrawn) = morpho.withdraw(marketParams, amount, supplyShares, onBehalf, receiver);
+}
+```
+
+### Smart Withdrawal (Amount or All)
+
+```solidity
+/// @notice Handles the withdrawal of a specified amount of assets by the caller from a specific market. If the
+/// amount is greater than the total amount suplied by the user, withdraws all the shares of the user.
+/// @param marketParams The parameters of the market.
+/// @param amount The amount of assets the user is withdrawing.
+/// @return assetsWithdrawn The actual amount of assets withdrawn.
+/// @return sharesWithdrawn The shares withdrawn in return for the assets.
+function withdrawAmountOrAll(MarketParams memory marketParams, uint256 amount)
+    external
+    returns (uint256 assetsWithdrawn, uint256 sharesWithdrawn)
+{
+    Id id = marketParams.id();
+
+    address onBehalf = msg.sender;
+    address receiver = msg.sender;
+
+    morpho.accrueInterest(marketParams);
+    uint256 totalSupplyAssets = morpho.totalSupplyAssets(id);
+    uint256 totalSupplyShares = morpho.totalSupplyShares(id);
+    uint256 shares = morpho.supplyShares(id, msg.sender);
+
+    uint256 assetsMax = shares.toAssetsDown(totalSupplyAssets, totalSupplyShares);
+
+    if (amount >= assetsMax) {
+        (assetsWithdrawn, sharesWithdrawn) = morpho.withdraw(marketParams, 0, shares, onBehalf, receiver);
+    } else {
+        (assetsWithdrawn, sharesWithdrawn) = morpho.withdraw(marketParams, amount, 0, onBehalf, receiver);
+    }
+}
+```
+
+This function is particularly useful as it explicitly calls `accrueInterest` before calculating the maximum withdrawable amount, ensuring all interest is included. It then intelligently chooses between withdrawing a specific amount or all available assets.
+
+## Complete Position Management Workflow
+
+A typical workflow for managing lending positions using MorphoBlueSnippets might look like:
+
+1. **Supply Assets**:
+   ```solidity
+   (uint256 assetsSupplied, uint256 sharesReceived) = snippets.supply(marketParams, supplyAmount);
+   ```
+
+2. **Monitor APY**:
+   ```solidity
+   uint256 currentApy = snippets.supplyAPY(marketParams, market);
+   ```
+
+3. **Check Balance with Interest**:
+   ```solidity
+   uint256 balance = snippets.supplyAssetsUser(marketParams, address(this));
+   ```
+
+4. **Partial Withdrawal**:
+   ```solidity
+   (uint256 withdrawnAssets, ) = snippets.withdraw50Percent(marketParams);
+   ```
+
+5. **Full Withdrawal**:
+   ```solidity
+   (uint256 withdrawnAssets, ) = snippets.withdrawAll(marketParams);
+   ```
+
+By combining these functions, users can effectively manage their lending positions while maximizing interest earnings and minimizing gas costs. 

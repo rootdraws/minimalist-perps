@@ -478,3 +478,105 @@ event LiquidationFailed(uint256 indexed positionId, string reason);
 5. **Position Monitoring**
    - Implement cost-effective position monitoring
    - Set appropriate warning thresholds for positions nearing liquidation
+
+## Callback-Based Liquidations
+
+Morpho supports liquidations with callbacks, allowing liquidators to perform liquidations without holding the repayment tokens upfront. This is particularly useful for:
+
+1. Enabling liquidation bots to operate with minimal capital
+2. Facilitating flash-loan-like liquidation operations
+3. Implementing just-in-time swaps of seized collateral to repay debt
+
+### Callback Interface Implementation
+
+```solidity
+// Implementation of the IMorphoLiquidateCallback interface
+contract LiquidationWithCallback is IMorphoLiquidateCallback {
+    using SafeTransferLib for ERC20;
+    
+    IMorpho public immutable morpho;
+    ISwap public immutable swapper;
+    
+    // Type of liquidation callback data
+    struct LiquidateData {
+        address collateralToken;
+    }
+    
+    modifier onlyMorpho() {
+        require(msg.sender == address(morpho), "msg.sender should be Morpho Blue");
+        _;
+    }
+    
+    // This function is called by Morpho during the liquidation process
+    function onMorphoLiquidate(uint256, bytes calldata data) external onlyMorpho {
+        LiquidateData memory decoded = abi.decode(data, (LiquidateData));
+        
+        // Approve swapper to use seized collateral
+        ERC20(decoded.collateralToken).approve(address(swapper), type(uint256).max);
+        
+        // Swap seized collateral for loan tokens to complete the liquidation
+        swapper.swapCollatToLoan(ERC20(decoded.collateralToken).balanceOf(address(this)));
+    }
+}
+```
+
+### Liquidation Without Upfront Capital
+
+```solidity
+function fullLiquidationWithoutCollat(
+    MarketParams calldata marketParams,
+    address borrower,
+    bool seizeFullCollat
+) public returns (uint256 seizedAssets, uint256 repaidAssets) {
+    Id id = marketParams.id();
+    
+    uint256 seizedCollateral;
+    uint256 repaidShares;
+    
+    if (seizeFullCollat) {
+        // Liquidate by specifying collateral amount (seize all available)
+        seizedCollateral = morpho.collateral(id, borrower);
+    } else {
+        // Liquidate by specifying shares amount (repay all debt)
+        repaidShares = morpho.borrowShares(id, borrower);
+    }
+    
+    // Approve Morpho to use loan tokens after they're obtained in the callback
+    _approveMaxTo(marketParams.loanToken, address(morpho));
+    
+    // Execute liquidation with callback
+    (seizedAssets, repaidAssets) = morpho.liquidate(
+        marketParams,
+        borrower,
+        seizedCollateral,
+        repaidShares,
+        abi.encode(LiquidateData(marketParams.collateralToken))
+    );
+    
+    // Forward loan tokens to the caller
+    ERC20(marketParams.loanToken).safeTransfer(
+        msg.sender,
+        ERC20(marketParams.loanToken).balanceOf(address(this))
+    );
+}
+```
+
+### Liquidation Flow with Callbacks
+
+1. The liquidator calls `fullLiquidationWithoutCollat`
+2. Morpho seizes the collateral from the borrower
+3. Before requiring repayment, Morpho calls `onMorphoLiquidate` on the liquidation contract
+4. The callback swaps the seized collateral for loan tokens via an external swapper
+5. After the callback completes, Morpho completes the liquidation using the newly acquired loan tokens
+6. Any profit (excess loan tokens) is forwarded to the original caller
+
+### Integration Considerations
+
+When implementing callback-based liquidations, consider:
+
+1. **Slippage Protection**: Ensure swaps have appropriate slippage protection
+2. **MEV Protection**: Be aware of potential MEV (Miner Extractable Value) during swaps
+3. **Gas Efficiency**: Use gas-efficient swap routes to maximize profitability
+4. **Revert Handling**: Properly handle cases where swaps or callbacks revert
+
+This callback-based approach allows liquidations to be performed without capital lockup, enabling more efficient liquidator operations and potentially faster liquidation of unhealthy positions.

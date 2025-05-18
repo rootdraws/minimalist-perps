@@ -338,3 +338,210 @@ function reducePosition(
 5. **Gas Optimization**:
    - Repaying full positions can save gas on future interest calculations
    - Batch repayments across multiple positions if managing a portfolio 
+
+## Simplified Implementation from MorphoBlueSnippets
+
+MorphoBlueSnippets provides efficient implementations of repayment functions with various strategies:
+
+### Basic Repayment
+
+```solidity
+/// @notice Handles the repayment of a specified amount of assets by the caller to a specific market.
+/// @param marketParams The parameters of the market.
+/// @param amount The amount of assets the user is repaying.
+/// @return assetsRepaid The actual amount of assets repaid.
+/// @return sharesRepaid The shares repaid in return for the assets.
+function repayAmount(MarketParams memory marketParams, uint256 amount)
+    external
+    returns (uint256 assetsRepaid, uint256 sharesRepaid)
+{
+    ERC20(marketParams.loanToken).forceApprove(address(morpho), type(uint256).max);
+    ERC20(marketParams.loanToken).safeTransferFrom(msg.sender, address(this), amount);
+
+    uint256 shares;
+    address onBehalf = msg.sender;
+    (assetsRepaid, sharesRepaid) = morpho.repay(marketParams, amount, shares, onBehalf, hex"");
+}
+```
+
+### Repay 50% of Loan
+
+```solidity
+/// @notice Handles the repayment of 50% of the borrowed assets by the caller to a specific market.
+/// @param marketParams The parameters of the market.
+/// @return assetsRepaid The actual amount of assets repaid.
+/// @return sharesRepaid The shares repaid in return for the assets.
+function repay50Percent(MarketParams memory marketParams)
+    external
+    returns (uint256 assetsRepaid, uint256 sharesRepaid)
+{
+    ERC20(marketParams.loanToken).forceApprove(address(morpho), type(uint256).max);
+
+    Id marketId = marketParams.id();
+
+    (,, uint256 totalBorrowAssets, uint256 totalBorrowShares) = morpho.expectedMarketBalances(marketParams);
+    uint256 borrowShares = morpho.position(marketId, msg.sender).borrowShares;
+
+    uint256 repaidAmount = (borrowShares / 2).toAssetsUp(totalBorrowAssets, totalBorrowShares);
+    ERC20(marketParams.loanToken).safeTransferFrom(msg.sender, address(this), repaidAmount);
+
+    uint256 amount;
+    address onBehalf = msg.sender;
+
+    (assetsRepaid, sharesRepaid) = morpho.repay(marketParams, amount, borrowShares / 2, onBehalf, hex"");
+}
+```
+
+### Repay Full Loan
+
+```solidity
+/// @notice Handles the repayment of all the borrowed assets by the caller to a specific market.
+/// @param marketParams The parameters of the market.
+/// @return assetsRepaid The actual amount of assets repaid.
+/// @return sharesRepaid The shares repaid in return for the assets.
+function repayAll(MarketParams memory marketParams) 
+    external 
+    returns (uint256 assetsRepaid, uint256 sharesRepaid) 
+{
+    ERC20(marketParams.loanToken).forceApprove(address(morpho), type(uint256).max);
+
+    Id marketId = marketParams.id();
+
+    (,, uint256 totalBorrowAssets, uint256 totalBorrowShares) = morpho.expectedMarketBalances(marketParams);
+    uint256 borrowShares = morpho.position(marketId, msg.sender).borrowShares;
+
+    uint256 repaidAmount = borrowShares.toAssetsUp(totalBorrowAssets, totalBorrowShares);
+    ERC20(marketParams.loanToken).safeTransferFrom(msg.sender, address(this), repaidAmount);
+
+    uint256 amount;
+    address onBehalf = msg.sender;
+    (assetsRepaid, sharesRepaid) = morpho.repay(marketParams, amount, borrowShares, onBehalf, hex"");
+}
+```
+
+### Smart Repayment (Amount or Full)
+
+```solidity
+/// @notice Handles the repayment of a specified amount of assets by the caller to a specific market. If the amount
+/// is greater than the total amount borrowed by the user, repays all the shares of the user.
+/// @param marketParams The parameters of the market.
+/// @param amount The amount of assets the user is repaying.
+/// @return assetsRepaid The actual amount of assets repaid.
+/// @return sharesRepaid The shares repaid in return for the assets.
+function repayAmountOrAll(MarketParams memory marketParams, uint256 amount)
+    external
+    returns (uint256 assetsRepaid, uint256 sharesRepaid)
+{
+    ERC20(marketParams.loanToken).forceApprove(address(morpho), type(uint256).max);
+
+    Id id = marketParams.id();
+
+    address onBehalf = msg.sender;
+
+    morpho.accrueInterest(marketParams);
+    uint256 totalBorrowAssets = morpho.totalBorrowAssets(id);
+    uint256 totalBorrowShares = morpho.totalBorrowShares(id);
+    uint256 shares = morpho.borrowShares(id, msg.sender);
+    uint256 assetsMax = shares.toAssetsUp(totalBorrowAssets, totalBorrowShares);
+
+    if (amount >= assetsMax) {
+        ERC20(marketParams.loanToken).safeTransferFrom(msg.sender, address(this), assetsMax);
+        (assetsRepaid, sharesRepaid) = morpho.repay(marketParams, 0, shares, onBehalf, hex"");
+    } else {
+        ERC20(marketParams.loanToken).safeTransferFrom(msg.sender, address(this), amount);
+        (assetsRepaid, sharesRepaid) = morpho.repay(marketParams, amount, 0, onBehalf, hex"");
+    }
+}
+```
+
+## Accurate Borrow Balance and Health Factor Calculation
+
+MorphoBlueSnippets provides utilities for accurately determining a user's borrow balance and health factor:
+
+```solidity
+/// @notice Calculates the total borrow balance of a given user in a specific market.
+/// @param marketParams The parameters of the market.
+/// @param user The address of the user whose borrow balance is being calculated.
+/// @return totalBorrowAssets The calculated total borrow balance.
+function borrowAssetsUser(MarketParams memory marketParams, address user)
+    public
+    view
+    returns (uint256 totalBorrowAssets)
+{
+    totalBorrowAssets = morpho.expectedBorrowAssets(marketParams, user);
+}
+
+/// @notice Calculates the health factor of a user in a specific market.
+/// @param marketParams The parameters of the market.
+/// @param id The identifier of the market.
+/// @param user The address of the user whose health factor is being calculated.
+/// @return healthFactor The calculated health factor.
+function userHealthFactor(MarketParams memory marketParams, Id id, address user)
+    public
+    view
+    returns (uint256 healthFactor)
+{
+    uint256 collateralPrice = IOracle(marketParams.oracle).price();
+    uint256 collateral = morpho.collateral(id, user);
+    uint256 borrowed = morpho.expectedBorrowAssets(marketParams, user);
+
+    uint256 maxBorrow = collateral.mulDivDown(collateralPrice, ORACLE_PRICE_SCALE).wMulDown(marketParams.lltv);
+
+    if (borrowed == 0) return type(uint256).max;
+    healthFactor = maxBorrow.wDivDown(borrowed);
+}
+```
+
+## Key Improvements Over Basic Implementation
+
+The MorphoBlueSnippets implementations offer several advantages over the basic implementation:
+
+1. **Better Interest Accrual**: Explicitly calls `accrueInterest` and uses `expectedMarketBalances` to ensure the most up-to-date values for conversions between shares and assets.
+
+2. **Optimized Token Handling**: Uses `forceApprove` to handle token approvals more efficiently and avoid common approval issues.
+
+3. **Flexible Repayment Strategies**: Provides multiple repayment options (50%, full, or smart repayment) to handle different user scenarios elegantly.
+
+4. **Accurate Health Factor Calculation**: Uses oracle prices and expected borrow values to get a precise health factor that includes accrued interest.
+
+5. **Gas Efficiency**: Minimizes storage reads and uses optimized share-to-asset conversions to reduce gas costs.
+
+## Integrating with Health Monitoring
+
+To implement a complete repayment strategy that monitors user health:
+
+```solidity
+function repayToTargetHealthFactor(
+    MarketParams memory marketParams,
+    address user,
+    uint256 targetHealthFactor
+) external returns (uint256 repaidAssets) {
+    Id id = marketParams.id();
+    
+    // Get current health factor
+    uint256 currentHealthFactor = snippets.userHealthFactor(marketParams, id, user);
+    
+    // If health factor is already above target, no need to repay
+    if (currentHealthFactor >= targetHealthFactor) return 0;
+    
+    // Get current borrow balance
+    uint256 borrowed = snippets.borrowAssetsUser(marketParams, user);
+    
+    // Get collateral value in loan token units
+    uint256 collateralPrice = IOracle(marketParams.oracle).price();
+    uint256 collateral = morpho.collateral(id, user);
+    uint256 collateralValue = collateral.mulDivDown(collateralPrice, ORACLE_PRICE_SCALE).wMulDown(marketParams.lltv);
+    
+    // Calculate how much to repay to reach target health factor
+    // targetHF = collateralValue / (borrowed - repayAmount)
+    // repayAmount = borrowed - (collateralValue / targetHF)
+    uint256 repayAmount = borrowed - collateralValue.wDivDown(targetHealthFactor);
+    
+    // Execute repayment
+    (repaidAssets, ) = snippets.repayAmount(marketParams, repayAmount);
+    
+    return repaidAssets;
+}
+```
+
+This function demonstrates how to combine the health factor calculation with a targeted repayment to bring a position back to a safe level, which is a common use case for risk management in leveraged positions. 

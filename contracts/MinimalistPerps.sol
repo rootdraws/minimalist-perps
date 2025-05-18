@@ -3,7 +3,6 @@ pragma solidity 0.8.17;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import "@openzeppelin/contracts/token/ERC721/extensions/ERC721Enumerable.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/access/AccessControl.sol";
 import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
@@ -13,29 +12,8 @@ import "@uniswap/v3-periphery/contracts/interfaces/ISwapRouter.sol";
 import "@morpho-org/morpho-blue/src/interfaces/IMorpho.sol";
 import "@morpho-org/morpho-blue/src/interfaces/IMorphoCallbacks.sol";
 
-// NFT Contract for position ownership
-contract PerpsPositionNFT is ERC721Enumerable, AccessControl {
-    bytes32 public constant MINTER_ROLE = keccak256("MINTER_ROLE");
-    uint256 private _nextTokenId = 1;
-
-    constructor() ERC721("Perps Position", "PERPS") {
-        _setupRole(DEFAULT_ADMIN_ROLE, msg.sender);
-    }
-
-    function mint(address to) external onlyRole(MINTER_ROLE) returns (uint256) {
-        uint256 tokenId = _nextTokenId++;
-        _safeMint(to, tokenId);
-        return tokenId;
-    }
-
-    function burn(uint256 tokenId) external onlyRole(MINTER_ROLE) {
-        _burn(tokenId);
-    }
-
-    function supportsInterface(bytes4 interfaceId) public view override(ERC721Enumerable, AccessControl) returns (bool) {
-        return super.supportsInterface(interfaceId);
-    }
-}
+// Import NFT position contract
+import "./NFTPosition.sol";
 
 // Main contract handling all perpetual functions
 contract MinimalistPerps is 
@@ -63,7 +41,7 @@ contract MinimalistPerps is
     mapping(address => AggregatorV3Interface) public priceFeeds;
     mapping(address => address) public morphoMarkets;
     
-    PerpsPositionNFT public positionNFT;
+    NFTPosition public positionNFT;
     IMorpho public morpho;
     ISwapRouter public uniswapRouter;
     address public treasury;
@@ -97,7 +75,7 @@ contract MinimalistPerps is
         treasury = _treasury;
         
         // Deploy NFT contract
-        positionNFT = new PerpsPositionNFT();
+        positionNFT = new NFTPosition("Perps Position", "PERPS");
         positionNFT.grantRole(positionNFT.MINTER_ROLE(), address(this));
         
         _setupRole(DEFAULT_ADMIN_ROLE, msg.sender);

@@ -187,4 +187,208 @@ In our MinimalistPerps system, leveraging is a fundamental component that enable
 2. Capital efficiency for traders
 3. Flexible position sizing with limited upfront capital
 
-The implementation showcases how Morpho Blue's callback system enables complex financial operations in a gas-efficient, single-transaction process. 
+The implementation showcases how Morpho Blue's callback system enables complex financial operations in a gas-efficient, single-transaction process.
+
+## Position Monitoring and Risk Management
+
+Leveraged positions require active monitoring and management due to their increased risk profile. The MorphoBlueSnippets contract provides essential utilities for monitoring leveraged positions:
+
+### Health Factor Calculation
+
+```solidity
+/// @notice Calculates the health factor of a user in a specific market.
+/// @param marketParams The parameters of the market.
+/// @param id The identifier of the market.
+/// @param user The address of the user whose health factor is being calculated.
+/// @return healthFactor The calculated health factor.
+function userHealthFactor(MarketParams memory marketParams, Id id, address user)
+    public
+    view
+    returns (uint256 healthFactor)
+{
+    uint256 collateralPrice = IOracle(marketParams.oracle).price();
+    uint256 collateral = morpho.collateral(id, user);
+    uint256 borrowed = morpho.expectedBorrowAssets(marketParams, user);
+
+    uint256 maxBorrow = collateral.mulDivDown(collateralPrice, ORACLE_PRICE_SCALE).wMulDown(marketParams.lltv);
+
+    if (borrowed == 0) return type(uint256).max;
+    healthFactor = maxBorrow.wDivDown(borrowed);
+}
+```
+
+This function:
+1. Gets the current oracle price for the collateral
+2. Retrieves the user's collateral and borrow balances
+3. Calculates the maximum borrowing capacity
+4. Returns the health factor as the ratio of max borrow capacity to current borrowed amount
+
+A health factor below 1.0 means the position is eligible for liquidation, so it's crucial to maintain a buffer above this threshold.
+
+### Efficient Position Balance Monitoring
+
+MorphoBlueSnippets provides gas-efficient methods to track position components:
+
+```solidity
+/// @notice Calculates the total collateral balance of a given user in a specific market.
+/// @dev It uses extSloads to load only one storage slot of the Position struct and save gas.
+/// @param marketId The identifier of the market.
+/// @param user The address of the user whose collateral balance is being calculated.
+/// @return totalCollateralAssets The calculated total collateral balance.
+function collateralAssetsUser(Id marketId, address user) public view returns (uint256 totalCollateralAssets) {
+    bytes32[] memory slots = new bytes32[](1);
+    slots[0] = MorphoStorageLib.positionBorrowSharesAndCollateralSlot(marketId, user);
+    bytes32[] memory values = morpho.extSloads(slots);
+    totalCollateralAssets = uint256(values[0] >> 128);
+}
+
+/// @notice Calculates the total borrow balance of a given user in a specific market.
+/// @param marketParams The parameters of the market.
+/// @param user The address of the user whose borrow balance is being calculated.
+/// @return totalBorrowAssets The calculated total borrow balance.
+function borrowAssetsUser(MarketParams memory marketParams, address user)
+    public
+    view
+    returns (uint256 totalBorrowAssets)
+{
+    totalBorrowAssets = morpho.expectedBorrowAssets(marketParams, user);
+}
+```
+
+The `collateralAssetsUser` function is particularly efficient as it uses `extSloads` to directly access storage slots rather than making more expensive function calls.
+
+### Managing Leveraged Positions
+
+When managing leveraged positions, you can use the following functions from MorphoBlueSnippets:
+
+#### Adding More Collateral to Improve Health Factor
+
+```solidity
+function supplyCollateral(MarketParams memory marketParams, uint256 amount) external {
+    ERC20(marketParams.collateralToken).forceApprove(address(morpho), type(uint256).max);
+    ERC20(marketParams.collateralToken).safeTransferFrom(msg.sender, address(this), amount);
+
+    address onBehalf = msg.sender;
+
+    morpho.supplyCollateral(marketParams, amount, onBehalf, hex"");
+}
+```
+
+#### Reducing Leverage by Partially Repaying Debt
+
+```solidity
+function repay50Percent(MarketParams memory marketParams)
+    external
+    returns (uint256 assetsRepaid, uint256 sharesRepaid)
+{
+    ERC20(marketParams.loanToken).forceApprove(address(morpho), type(uint256).max);
+
+    Id marketId = marketParams.id();
+
+    (,, uint256 totalBorrowAssets, uint256 totalBorrowShares) = morpho.expectedMarketBalances(marketParams);
+    uint256 borrowShares = morpho.position(marketId, msg.sender).borrowShares;
+
+    uint256 repaidAmount = (borrowShares / 2).toAssetsUp(totalBorrowAssets, totalBorrowShares);
+    ERC20(marketParams.loanToken).safeTransferFrom(msg.sender, address(this), repaidAmount);
+
+    uint256 amount;
+    address onBehalf = msg.sender;
+
+    (assetsRepaid, sharesRepaid) = morpho.repay(marketParams, amount, borrowShares / 2, onBehalf, hex"");
+}
+```
+
+#### Customized Repayment to Target a Specific Health Factor
+
+```solidity
+function repayToTargetHealthFactor(
+    MarketParams memory marketParams,
+    address user,
+    uint256 targetHealthFactor
+) external returns (uint256 repaidAssets) {
+    Id id = marketParams.id();
+    
+    // Get current health factor
+    uint256 currentHealthFactor = userHealthFactor(marketParams, id, user);
+    
+    // If health factor is already above target, no need to repay
+    if (currentHealthFactor >= targetHealthFactor) return 0;
+    
+    // Get current borrow balance
+    uint256 borrowed = borrowAssetsUser(marketParams, user);
+    
+    // Get collateral value in loan token units
+    uint256 collateralPrice = IOracle(marketParams.oracle).price();
+    uint256 collateral = morpho.collateral(id, user);
+    uint256 collateralValue = collateral.mulDivDown(collateralPrice, ORACLE_PRICE_SCALE).wMulDown(marketParams.lltv);
+    
+    // Calculate how much to repay to reach target health factor
+    // targetHF = collateralValue / (borrowed - repayAmount)
+    // repayAmount = borrowed - (collateralValue / targetHF)
+    uint256 repayAmount = borrowed - collateralValue.wDivDown(targetHealthFactor);
+    
+    // Execute repayment
+    (repaidAssets, ) = repayAmount(marketParams, repayAmount);
+    
+    return repaidAssets;
+}
+```
+
+### Market Analysis for Leveraged Positions
+
+MorphoBlueSnippets provides functions to analyze market conditions, which is crucial for leveraged positions:
+
+```solidity
+/// @notice Calculates the total supply of assets in a specific market.
+/// @param marketParams The parameters of the market.
+/// @return totalSupplyAssets The calculated total supply of assets.
+function marketTotalSupply(MarketParams memory marketParams) public view returns (uint256 totalSupplyAssets) {
+    totalSupplyAssets = morpho.expectedTotalSupplyAssets(marketParams);
+}
+
+/// @notice Calculates the total borrow of assets in a specific market.
+/// @param marketParams The parameters of the market.
+/// @return totalBorrowAssets The calculated total borrow of assets.
+function marketTotalBorrow(MarketParams memory marketParams) public view returns (uint256 totalBorrowAssets) {
+    totalBorrowAssets = morpho.expectedTotalBorrowAssets(marketParams);
+}
+
+/// @notice Calculates the borrow APY (Annual Percentage Yield) for a given market.
+/// @param marketParams The parameters of the market.
+/// @param market The state of the market.
+/// @return borrowApy The calculated borrow APY (scaled by WAD).
+function borrowAPY(MarketParams memory marketParams, Market memory market)
+    public
+    view
+    returns (uint256 borrowApy)
+{
+    if (marketParams.irm != address(0)) {
+        borrowApy = IIrm(marketParams.irm).borrowRateView(marketParams, market).wTaylorCompounded(365 days);
+    }
+}
+```
+
+Monitoring these metrics helps users make informed decisions about when to leverage, deleverage, or adjust their positions.
+
+## Complete Leverage Management Strategy
+
+For optimal management of leveraged positions, implement the following strategy:
+
+1. **Creation**: Use the leveraging callback mechanism to create the position efficiently
+2. **Monitoring**: 
+   - Track health factor regularly using `userHealthFactor`
+   - Monitor borrow APY to anticipate interest costs
+   - Track collateral and borrow balances with the specialized functions
+
+3. **Risk Management**:
+   - Maintain a minimum health factor buffer (recommended: >1.5)
+   - Implement automatic health factor maintenance by:
+     - Adding collateral when health factor drops too low
+     - Partially repaying debt during market volatility
+
+4. **Exit Strategy**:
+   - Deleverage gradually using partial repayments
+   - Monitor slippage during exit to optimize outcomes
+   - Consider repaying fully during favorable market conditions
+
+A complete implementation would integrate position creation, monitoring, and management functions into a unified interface that provides a comprehensive view of the user's leveraged positions along with risk indicators and management options. 

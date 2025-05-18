@@ -341,3 +341,164 @@ function calculateHealthFactor(
    - Clearly communicate liquidation thresholds to users
    - Provide monitoring tools to track position health
    - Consider partial liquidations for large positions 
+
+## Simplified Implementation from MorphoBlueSnippets
+
+Here's a simplified implementation of the `supplyCollateral` function from the MorphoBlueSnippets contract:
+
+```solidity
+/// @notice Handles the supply of collateral by the caller to a specific market.
+/// @param marketParams The parameters of the market.
+/// @param amount The amount of collateral the user is supplying.
+function supplyCollateral(MarketParams memory marketParams, uint256 amount) external {
+    ERC20(marketParams.collateralToken).forceApprove(address(morpho), type(uint256).max);
+    ERC20(marketParams.collateralToken).safeTransferFrom(msg.sender, address(this), amount);
+
+    address onBehalf = msg.sender;
+
+    morpho.supplyCollateral(marketParams, amount, onBehalf, hex"");
+}
+```
+
+This implementation:
+1. Uses `forceApprove` to approve the Morpho contract to spend the collateral token
+2. Transfers the collateral token from the user to the contract
+3. Supplies the collateral to Morpho on behalf of the caller
+4. Doesn't include any callback data
+
+## Checking Collateral Balances
+
+MorphoBlueSnippets provides an efficient way to check collateral balances using direct storage access:
+
+```solidity
+/// @notice Calculates the total collateral balance of a given user in a specific market.
+/// @dev It uses extSloads to load only one storage slot of the Position struct and save gas.
+/// @param marketId The identifier of the market.
+/// @param user The address of the user whose collateral balance is being calculated.
+/// @return totalCollateralAssets The calculated total collateral balance.
+function collateralAssetsUser(Id marketId, address user) public view returns (uint256 totalCollateralAssets) {
+    bytes32[] memory slots = new bytes32[](1);
+    slots[0] = MorphoStorageLib.positionBorrowSharesAndCollateralSlot(marketId, user);
+    bytes32[] memory values = morpho.extSloads(slots);
+    totalCollateralAssets = uint256(values[0] >> 128);
+}
+```
+
+This method uses `extSloads` to efficiently read storage directly, which can save gas compared to using getters.
+
+## Optimized Health Factor Calculation
+
+The MorphoBlueSnippets contract provides a gas-efficient implementation of health factor calculation:
+
+```solidity
+/// @notice Calculates the health factor of a user in a specific market.
+/// @param marketParams The parameters of the market.
+/// @param id The identifier of the market.
+/// @param user The address of the user whose health factor is being calculated.
+/// @return healthFactor The calculated health factor.
+function userHealthFactor(MarketParams memory marketParams, Id id, address user)
+    public
+    view
+    returns (uint256 healthFactor)
+{
+    uint256 collateralPrice = IOracle(marketParams.oracle).price();
+    uint256 collateral = morpho.collateral(id, user);
+    uint256 borrowed = morpho.expectedBorrowAssets(marketParams, user);
+
+    uint256 maxBorrow = collateral.mulDivDown(collateralPrice, ORACLE_PRICE_SCALE).wMulDown(marketParams.lltv);
+
+    if (borrowed == 0) return type(uint256).max;
+    healthFactor = maxBorrow.wDivDown(borrowed);
+}
+```
+
+Key aspects of this implementation:
+1. Uses `expectedBorrowAssets` to include accrued interest
+2. Gets the oracle price directly from the market's oracle
+3. Calculates the maximum borrow amount based on collateral value and LLTV
+4. Returns `type(uint256).max` for positions with no debt
+5. Uses `wMulDown` and `wDivDown` for WAD-scaled operations with conservative rounding
+
+## Complete Position Management Workflow
+
+An effective approach to position management integrates supplying collateral with other operations. Here's a complete workflow using MorphoBlueSnippets:
+
+### 1. Supply Collateral
+
+```solidity
+// First step: supply collateral to secure the position
+snippets.supplyCollateral(marketParams, collateralAmount);
+```
+
+### 2. Check Health Factor Before Borrowing
+
+```solidity
+// Check current health factor before borrowing
+Id marketId = marketParams.id();
+uint256 healthFactor = snippets.userHealthFactor(marketParams, marketId, address(this));
+```
+
+### 3. Borrow Assets
+
+```solidity
+// Borrow assets against supplied collateral
+(uint256 assetsBorrowed, uint256 sharesBorrowed) = snippets.borrow(marketParams, borrowAmount);
+```
+
+### 4. Monitor Position Health
+
+```solidity
+// Check health factor after borrowing to ensure safety
+uint256 newHealthFactor = snippets.userHealthFactor(marketParams, marketId, address(this));
+require(newHealthFactor >= MINIMUM_HEALTH_FACTOR, "Position too risky");
+```
+
+### 5. Add More Collateral if Needed
+
+```solidity
+// If health factor is low, add more collateral
+if (newHealthFactor < SAFE_HEALTH_FACTOR) {
+    snippets.supplyCollateral(marketParams, additionalCollateralAmount);
+}
+```
+
+### 6. Partial Repayment to Reduce Risk
+
+```solidity
+// Repay part of the debt to improve health factor
+snippets.repay50Percent(marketParams);
+```
+
+### 7. Close Position
+
+```solidity
+// Repay all borrowed assets
+snippets.repayAll(marketParams);
+
+// Withdraw collateral after debt is cleared
+Id marketId = marketParams.id();
+uint256 collateralBalance = morpho.collateral(marketId, address(this));
+snippets.withdrawCollateral(marketParams, collateralBalance);
+```
+
+## Calculating APY for Collateral Utilization Decisions
+
+When deciding how much collateral to supply, it's important to consider the current APY in the market:
+
+```solidity
+/// @notice Calculates the borrow APY (Annual Percentage Yield) for a given market.
+/// @param marketParams The parameters of the market.
+/// @param market The state of the market.
+/// @return borrowApy The calculated borrow APY (scaled by WAD).
+function borrowAPY(MarketParams memory marketParams, Market memory market)
+    public
+    view
+    returns (uint256 borrowApy)
+{
+    if (marketParams.irm != address(0)) {
+        borrowApy = IIrm(marketParams.irm).borrowRateView(marketParams, market).wTaylorCompounded(365 days);
+    }
+}
+```
+
+This function helps users evaluate the cost of borrowing against their collateral, which is essential for making informed decisions about position management. 

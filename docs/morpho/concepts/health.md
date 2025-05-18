@@ -32,6 +32,59 @@ function _isHealthy(MarketParams memory marketParams, Id id, address borrower, u
 }
 ```
 
+## Quantitative Health Factor Calculation
+
+While the `_isHealthy` function returns a boolean indicating whether a position is healthy, it's often more useful to have a quantitative measure of position health. The `userHealthFactor` function provides this by calculating the ratio between maximum allowed borrowing and current borrowed amount:
+
+```solidity
+/// @notice Calculates the health factor of a user in a specific market
+/// @param marketParams The parameters of the market
+/// @param id The identifier of the market
+/// @param user The address of the user whose health factor is being calculated
+/// @return healthFactor The calculated health factor (scaled by WAD)
+function userHealthFactor(MarketParams memory marketParams, Id id, address user)
+    public
+    view
+    returns (uint256 healthFactor)
+{
+    uint256 collateralPrice = IOracle(marketParams.oracle).price();
+    uint256 collateral = morpho.collateral(id, user);
+    uint256 borrowed = morpho.expectedBorrowAssets(marketParams, user);
+
+    uint256 maxBorrow = collateral.mulDivDown(collateralPrice, ORACLE_PRICE_SCALE).wMulDown(marketParams.lltv);
+
+    if (borrowed == 0) return type(uint256).max; // No debt = maximum health
+    healthFactor = maxBorrow.wDivDown(borrowed);
+}
+```
+
+### Interpreting Health Factor Values
+
+The health factor is expressed as a ratio with WAD precision (1e18):
+
+- Health factor = 1e18 (1.0): Position is at the exact liquidation threshold
+- Health factor > 1e18: Position is healthy (the higher, the safer)
+- Health factor < 1e18: Position is eligible for liquidation
+
+For example:
+- Health factor of 2e18 (2.0): Position can withstand a 50% drop in collateral value
+- Health factor of 1.5e18 (1.5): Position can withstand a 33% drop in collateral value
+- Health factor of 0.8e18 (0.8): Position is underwater and can be liquidated
+
+### Using Expected Values for Accurate Health Calculation
+
+For the most accurate health assessment, always use the `expectedBorrowAssets` method instead of direct balance checks:
+
+```solidity
+// This includes accrued interest since the last update
+uint256 borrowed = morpho.expectedBorrowAssets(marketParams, user);
+
+// Instead of:
+// uint256 borrowed = morpho.borrowBalance(id, user);
+```
+
+This ensures that even if interest hasn't been formally accrued in storage, the health calculation reflects the actual current state including all pending interest.
+
 ## Core Concepts
 
 ### Liquidation-to-Value (LLTV)
@@ -239,6 +292,218 @@ function maxBorrowableAssets(MarketParams memory marketParams, address borrower)
     // Return additional borrowable amount, possibly 0 if already exceeded
     if (maxBorrow <= currentBorrowed) return 0;
     return maxBorrow - currentBorrowed;
+}
+```
+
+## Hypothetical Health Factor Calculations
+
+The VirtualHealthFactorSnippets contract provides essential functions for calculating how potential transactions would affect a position's health before actually executing them:
+
+```solidity
+/// @notice Calculates the health factor of a user in a specific market.
+/// @param marketParams The parameters of the market.
+/// @param id The identifier of the market.
+/// @param user The address of the user whose health factor is being calculated.
+/// @return healthFactor The calculated health factor.
+function userHealthFactor(MarketParams memory marketParams, Id id, address user)
+    public
+    view
+    returns (uint256 healthFactor)
+{
+    uint256 collateralPrice = IOracle(marketParams.oracle).price();
+    uint256 collateral = morpho.collateral(id, user);
+    uint256 borrowed = morpho.expectedBorrowAssets(marketParams, user);
+
+    uint256 maxBorrow = collateral.mulDivDown(collateralPrice, ORACLE_PRICE_SCALE).wMulDown(marketParams.lltv);
+
+    if (borrowed == 0) return type(uint256).max;
+    return maxBorrow.wDivDown(borrowed);
+}
+
+/// @notice Calculates the health factor of a user after a virtual repayment.
+/// @param marketParams The parameters of the market.
+/// @param id The identifier of the market.
+/// @param user The address of the user whose health factor is being calculated.
+/// @param repaidAssets The amount of assets to be virtually repaid.
+/// @return healthFactor The calculated health factor after the virtual repayment.
+function userHypotheticalHealthFactor(
+    MarketParams memory marketParams,
+    Id id,
+    address user,
+    uint256 repaidAssets
+) public view returns (uint256 healthFactor) {
+    uint256 collateralPrice = IOracle(marketParams.oracle).price();
+    uint256 collateral = morpho.collateral(id, user);
+    uint256 borrowed = morpho.expectedBorrowAssets(marketParams, user);
+
+    uint256 newBorrowed = borrowed > repaidAssets ? borrowed - repaidAssets : 0;
+    
+    uint256 maxBorrow = collateral.mulDivDown(collateralPrice, ORACLE_PRICE_SCALE).wMulDown(marketParams.lltv);
+
+    return newBorrowed == 0 ? type(uint256).max : maxBorrow.wDivDown(newBorrowed);
+}
+
+/// @notice Calculates the health factor of a user after a virtual borrow.
+/// @param marketParams The parameters of the market.
+/// @param id The identifier of the market.
+/// @param user The address of the user whose health factor is being calculated.
+/// @param borrowAmount The amount of assets to be virtually borrowed.
+/// @return healthFactor The calculated health factor after the virtual borrow.
+function userHealthFactorAfterVirtualBorrow(
+    MarketParams memory marketParams,
+    Id id,
+    address user,
+    uint256 borrowAmount
+) public view returns (uint256 healthFactor) {
+    uint256 collateralPrice = IOracle(marketParams.oracle).price();
+    uint256 collateral = morpho.collateral(id, user);
+    uint256 borrowed = morpho.expectedBorrowAssets(marketParams, user);
+
+    uint256 newBorrowed = borrowed + borrowAmount;
+
+    uint256 maxBorrow = collateral.mulDivDown(collateralPrice, ORACLE_PRICE_SCALE).wMulDown(marketParams.lltv);
+
+    return newBorrowed == 0 ? type(uint256).max : maxBorrow.wDivDown(newBorrowed);
+}
+```
+
+### Virtual Health Factor with Collateral Changes
+
+Here's an additional useful function for simulating the health factor after adding or removing collateral:
+
+```solidity
+/// @notice Calculates the health factor of a user after a virtual collateral change.
+/// @param marketParams The parameters of the market.
+/// @param id The identifier of the market.
+/// @param user The address of the user whose health factor is being calculated.
+/// @param collateralDelta The amount of collateral to be virtually added (positive) or removed (negative).
+/// @return healthFactor The calculated health factor after the virtual collateral change.
+function userHealthFactorAfterVirtualCollateralChange(
+    MarketParams memory marketParams,
+    Id id,
+    address user,
+    int256 collateralDelta
+) public view returns (uint256 healthFactor) {
+    uint256 collateralPrice = IOracle(marketParams.oracle).price();
+    uint256 collateral = morpho.collateral(id, user);
+    uint256 borrowed = morpho.expectedBorrowAssets(marketParams, user);
+    
+    // Calculate new collateral amount
+    uint256 newCollateral;
+    if (collateralDelta >= 0) {
+        newCollateral = collateral + uint256(collateralDelta);
+    } else {
+        uint256 collateralToRemove = uint256(-collateralDelta);
+        newCollateral = collateral > collateralToRemove ? collateral - collateralToRemove : 0;
+    }
+    
+    uint256 maxBorrow = newCollateral.mulDivDown(collateralPrice, ORACLE_PRICE_SCALE).wMulDown(marketParams.lltv);
+    
+    if (borrowed == 0) return type(uint256).max;
+    return maxBorrow.wDivDown(borrowed);
+}
+```
+
+### Combined Position Simulation
+
+This function simulates multiple operation types at once for more complex scenarios:
+
+```solidity
+/// @notice Simulates health factor after multiple operations.
+/// @param marketParams The parameters of the market.
+/// @param id The identifier of the market.
+/// @param user The address of the user.
+/// @param collateralDelta The change in collateral (positive for add, negative for remove).
+/// @param borrowDelta The change in borrow (positive for borrow more, negative for repay).
+/// @return healthFactor The calculated health factor after all operations.
+function simulateHealthFactor(
+    MarketParams memory marketParams,
+    Id id,
+    address user,
+    int256 collateralDelta,
+    int256 borrowDelta
+) public view returns (uint256 healthFactor) {
+    uint256 collateralPrice = IOracle(marketParams.oracle).price();
+    uint256 collateral = morpho.collateral(id, user);
+    uint256 borrowed = morpho.expectedBorrowAssets(marketParams, user);
+    
+    // Calculate new collateral amount
+    uint256 newCollateral;
+    if (collateralDelta >= 0) {
+        newCollateral = collateral + uint256(collateralDelta);
+    } else {
+        uint256 collateralToRemove = uint256(-collateralDelta);
+        newCollateral = collateral > collateralToRemove ? collateral - collateralToRemove : 0;
+    }
+    
+    // Calculate new borrow amount
+    uint256 newBorrowed;
+    if (borrowDelta >= 0) {
+        newBorrowed = borrowed + uint256(borrowDelta);
+    } else {
+        uint256 borrowToRepay = uint256(-borrowDelta);
+        newBorrowed = borrowed > borrowToRepay ? borrowed - borrowToRepay : 0;
+    }
+    
+    uint256 maxBorrow = newCollateral.mulDivDown(collateralPrice, ORACLE_PRICE_SCALE).wMulDown(marketParams.lltv);
+    
+    if (newBorrowed == 0) return type(uint256).max;
+    return maxBorrow.wDivDown(newBorrowed);
+}
+```
+
+### User Interface Applications
+
+These hypothetical health factor calculations are particularly useful for:
+
+1. **Pre-transaction estimation:** Show users how a transaction will affect their position health before they submit it
+2. **Slider interfaces:** Allow users to visualize health impacts as they adjust transaction parameters
+3. **Risk warnings:** Preemptively warn users if a planned action would bring them close to liquidation
+4. **Optimal transaction sizing:** Help users calculate the maximum safe amount they can borrow or withdraw
+
+### Implementation in dApp UI
+
+Here's a pseudocode example for implementing this in a frontend:
+
+```javascript
+// Calculate and display health factor for a planned transaction
+async function displayHealthImpact(user, market, action, amount) {
+  // Get market parameters from contract
+  const marketParams = await getMarketParams(market);
+  const marketId = await getMarketId(marketParams);
+  
+  let hypotheticalHealth;
+  
+  // Determine which function to call based on action type
+  switch(action) {
+    case 'borrow':
+      hypotheticalHealth = await virtualHealthFactorContract.userHealthFactorAfterVirtualBorrow(
+        marketParams, marketId, user, amount
+      );
+      break;
+    case 'repay':
+      hypotheticalHealth = await virtualHealthFactorContract.userHypotheticalHealthFactor(
+        marketParams, marketId, user, amount
+      );
+      break;
+    case 'addCollateral':
+      hypotheticalHealth = await virtualHealthFactorContract.userHealthFactorAfterVirtualCollateralChange(
+        marketParams, marketId, user, amount
+      );
+      break;
+    case 'removeCollateral':
+      hypotheticalHealth = await virtualHealthFactorContract.userHealthFactorAfterVirtualCollateralChange(
+        marketParams, marketId, user, -amount
+      );
+      break;
+  }
+  
+  // Display in UI
+  if (hypotheticalHealth < 1.2e18) {
+    displayWarning("This transaction will put your position at risk of liquidation");
+  }
+  
+  updateHealthDisplay(formatHealthFactor(hypotheticalHealth));
 }
 ```
 
